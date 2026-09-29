@@ -365,7 +365,7 @@ export class ModelEditor {
      * 与 auxiliaryModelSettings/usagesView 的做法保持一致
      */
     private static getDistUiPath(): string {
-        const extension = vscode.extensions.getExtension('vicanent.gcmp');
+        const extension = vscode.extensions.getExtension('vicanent.gcmp-fork');
         if (!extension) {
             // 极端情况（扩展未注册），回退到 __dirname 推算
             return path.join(__dirname, '..', 'ui');

@@ -204,6 +204,7 @@ export class CodexCliAuth extends BaseCliAuth {
     protected async afterLoadCredentials(credentials: OAuthCredentials): Promise<OAuthCredentials> {
         // 检查是否是 Codex CLI 的嵌套格式
         const rawData = credentials as unknown as {
+            OPENAI_API_KEY?: string;
             tokens?: {
                 access_token?: string;
                 refresh_token?: string;
@@ -212,6 +213,16 @@ export class CodexCliAuth extends BaseCliAuth {
             };
             last_refresh?: string;
         };
+
+        // `codex login --with-api-key` / forced_login_method = "api" stores the
+        // key at the top level instead of creating an OAuth tokens object.
+        if (typeof rawData.OPENAI_API_KEY === 'string' && rawData.OPENAI_API_KEY.trim()) {
+            return {
+                access_token: rawData.OPENAI_API_KEY.trim(),
+                refresh_token: '',
+                expiry_date: 0
+            };
+        }
 
         // 如果存在 tokens 对象，提取其中的字段
         if (rawData.tokens) {

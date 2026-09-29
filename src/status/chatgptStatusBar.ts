@@ -20,6 +20,7 @@ import { formatChatGPTPlanType } from '../quota/parsers/chatgptPlanType';
 import { formatDateTimeSlash } from '../quota/format';
 import { CliAuthFactory } from '../cli/auth/cliAuthFactory';
 import { CodexCliAuth } from '../cli/auth/codexCliAuth';
+import { readCodexCliConfig } from '../cli/codexCliConfig';
 
 export type { ChatGPTStatusData } from '../quota/codexQuota';
 
@@ -176,6 +177,12 @@ export class ChatGPTStatusBar extends BaseStatusBarItem<ChatGPTStatusData> {
      */
     protected async shouldShowStatusBar(): Promise<boolean> {
         try {
+            const customProviderEnabled = vscode.workspace
+                .getConfiguration('gcmp.codex')
+                .get<boolean>('allowCustomProviderWithoutUsage', false);
+            if (customProviderEnabled && readCodexCliConfig()) {
+                return false;
+            }
             const codexAuth = CliAuthFactory.getInstance('codex') as CodexCliAuth | null;
             if (!codexAuth) {
                 return false;

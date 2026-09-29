@@ -1,4 +1,4 @@
-# GCMP - Multi-Provider AI Chat Models for GitHub Copilot
+# GCMP Fork - Multi-Provider AI Chat Models for GitHub Copilot
 
 English | **[中文](README.md)**
 
@@ -208,9 +208,11 @@ npm install -g @openai/codex@latest
 - **Supported models**: See [config/codex.json](src/providers/config/codex.json).
 - **Usage tracking**: Status bar displays remaining ChatGPT subscription cycle quota.
 - **Independent proxy settings**: use this machine's `gcmp.machineOverrides.codex.proxy` to assign a dedicated proxy for Codex requests without affecting other machines.
+- **Codex CLI custom providers**: enable `gcmp.codex.allowCustomProviderWithoutUsage` to use the active `model_provider` from `~/.codex/config.toml`, including its `base_url`, `wire_api`, `model_catalog_json`, and API-key configuration. Codex models remain available when that provider has no ChatGPT usage endpoint; ChatGPT subscription quota is not displayed in this mode.
 
 ```json
 {
+    "gcmp.codex.allowCustomProviderWithoutUsage": true,
     "gcmp.machineOverrides": {
         "codex": {
             "proxy": "http://127.0.0.1:10808"

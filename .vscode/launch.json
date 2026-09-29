@@ -30,7 +30,7 @@
             "type": "extensionHost",
             "request": "launch",
             "testConfiguration": "${workspaceFolder}/.vscode-test.mjs",
-            "args": ["--extensionDevelopmentPath=${workspaceFolder}", "--enable-proposed-api=vicanent.gcmp"],
+            "args": ["--extensionDevelopmentPath=${workspaceFolder}", "--enable-proposed-api=vicanent.gcmp-fork"],
             "outFiles": ["${workspaceFolder}/dist/**/*.js", "${workspaceFolder}/out/integration/**/*.js"],
             "preLaunchTask": "npm: compile:vscode-test",
             "sourceMaps": true

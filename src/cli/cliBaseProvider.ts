@@ -32,6 +32,11 @@ export class CliBaseProvider extends GenericModelProvider {
         super(context, providerKey, providerConfig);
     }
 
+    /** Subclasses may opt into an API key supplied by a CLI custom-provider config. */
+    protected allowStoredApiKeyWithoutCliCredentials(): boolean {
+        return false;
+    }
+
     /**
      * 重写模型信息提供方法
      * 当没有 API 密钥时，启动配置向导而不是要求输入 API 密钥
@@ -44,6 +49,10 @@ export class CliBaseProvider extends GenericModelProvider {
         if (options.configuration) {
             // 如果请求中包含 configuration，不返回模型列表
             return [];
+        }
+
+        if (this.allowStoredApiKeyWithoutCliCredentials() && (await ApiKeyManager.hasValidApiKey(this.providerKey))) {
+            return super.provideLanguageModelChatInformation(options, token);
         }
 
         // 检查是否有有效的 API 密钥

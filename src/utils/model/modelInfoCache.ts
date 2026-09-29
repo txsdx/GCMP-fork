@@ -87,7 +87,7 @@ export class ModelInfoCache {
             }
 
             // 检查 1: 版本匹配
-            const currentVersion = vscode.extensions.getExtension('vicanent.gcmp')?.packageJSON.version || '';
+            const currentVersion = vscode.extensions.getExtension('vicanent.gcmp-fork')?.packageJSON.version || '';
             if (cached.extensionVersion !== currentVersion) {
                 Logger.trace(
                     `[ModelInfoCache] ${providerKey}: version mismatch ` +
@@ -137,7 +137,7 @@ export class ModelInfoCache {
      */
     async cacheModels(providerKey: string, models: LanguageModelChatInformation[], apiKeyHash: string): Promise<void> {
         try {
-            const currentVersion = vscode.extensions.getExtension('vicanent.gcmp')?.packageJSON.version || '';
+            const currentVersion = vscode.extensions.getExtension('vicanent.gcmp-fork')?.packageJSON.version || '';
 
             const cacheData: CachedModelInfo = {
                 models,

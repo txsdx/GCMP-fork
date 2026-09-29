@@ -31,8 +31,8 @@ export interface GeminiToolCallMarker {
     name: string;
 }
 
-const StatefulMarkerExtension = 'vicanent.gcmp';
-type StatefulMarkerExtension = 'vicanent.gcmp';
+const StatefulMarkerExtension = 'vicanent.gcmp-fork';
+type StatefulMarkerExtension = 'vicanent.gcmp-fork';
 export interface StatefulMarkerContainer {
     extension: StatefulMarkerExtension;
     provider: string;

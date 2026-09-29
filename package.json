@@ -1,7 +1,7 @@
 {
-    "name": "gcmp",
+    "name": "gcmp-fork",
     "publisher": "vicanent",
-    "displayName": "AI Chat Models",
+    "displayName": "AI Chat Models Fork",
     "description": "%extension.description%",
     "version": "0.28.4",
     "license": "MIT",
@@ -357,7 +357,7 @@
             }
         ],
         "configuration": {
-            "title": "GCMP - AI Chat Models",
+            "title": "GCMP - AI Chat Models Fork",
             "properties": {
                 "gcmp.proxy": {
                     "type": "string",
@@ -381,6 +381,12 @@
                     "default": true,
                     "description": "%setting.tls.useSystemCertificates.description%",
                     "scope": "application"
+                },
+                "gcmp.codex.allowCustomProviderWithoutUsage": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "%setting.codex.allowCustomProviderWithoutUsage.description%",
+                    "scope": "machine"
                 },
                 "gcmp.maxTokens": {
                     "type": "number",
@@ -946,102 +952,102 @@
         "languageModelChatProviders": [
             {
                 "vendor": "gcmp.zhipu",
-                "displayName": "GCMP · ZhipuAI",
+                "displayName": "GCMP · ZhipuAI Fork",
                 "managementCommand": "gcmp.zhipu.configWizard"
             },
             {
                 "vendor": "gcmp.minimax",
-                "displayName": "GCMP · MiniMax",
+                "displayName": "GCMP · MiniMax Fork",
                 "managementCommand": "gcmp.minimax.configWizard"
             },
             {
                 "vendor": "gcmp.moonshot",
-                "displayName": "GCMP · MoonshotAI",
+                "displayName": "GCMP · MoonshotAI Fork",
                 "managementCommand": "gcmp.moonshot.configWizard"
             },
             {
                 "vendor": "gcmp.deepseek",
-                "displayName": "GCMP · DeepSeek",
+                "displayName": "GCMP · DeepSeek Fork",
                 "managementCommand": "gcmp.deepseek.setApiKey"
             },
             {
                 "vendor": "gcmp.dashscope",
-                "displayName": "GCMP · AliDashScope",
+                "displayName": "GCMP · AliDashScope Fork",
                 "managementCommand": "gcmp.dashscope.configWizard"
             },
             {
                 "vendor": "gcmp.volcengine",
-                "displayName": "GCMP · Volcengine",
+                "displayName": "GCMP · Volcengine Fork",
                 "managementCommand": "gcmp.volcengine.configWizard"
             },
             {
                 "vendor": "gcmp.tencent",
-                "displayName": "GCMP · Tencent",
+                "displayName": "GCMP · Tencent Fork",
                 "managementCommand": "gcmp.tencent.configWizard"
             },
             {
                 "vendor": "gcmp.xiaomimimo",
-                "displayName": "GCMP · Xiaomi MiMo",
+                "displayName": "GCMP · Xiaomi MiMo Fork",
                 "managementCommand": "gcmp.xiaomimimo.configWizard"
             },
             {
                 "vendor": "gcmp.baidu",
-                "displayName": "GCMP · Baidu Qianfan",
+                "displayName": "GCMP · Baidu Qianfan Fork",
                 "managementCommand": "gcmp.baidu.configWizard"
             },
             {
                 "vendor": "gcmp.stepfun",
-                "displayName": "GCMP · StepFun",
+                "displayName": "GCMP · StepFun Fork",
                 "managementCommand": "gcmp.stepfun.configWizard"
             },
             {
                 "vendor": "gcmp.antling",
-                "displayName": "GCMP · AntLing",
+                "displayName": "GCMP · AntLing Fork",
                 "managementCommand": "gcmp.antling.setApiKey"
             },
             {
                 "vendor": "gcmp.xfyun",
-                "displayName": "GCMP · XunFei Astron",
+                "displayName": "GCMP · XunFei Astron Fork",
                 "managementCommand": "gcmp.xfyun.configWizard"
             },
             {
                 "vendor": "gcmp.longcat",
-                "displayName": "GCMP · LongCat",
+                "displayName": "GCMP · LongCat Fork",
                 "managementCommand": "gcmp.longcat.setApiKey"
             },
             {
                 "vendor": "gcmp.opencode",
-                "displayName": "GCMP · OpenCode",
+                "displayName": "GCMP · OpenCode Fork",
                 "managementCommand": "gcmp.opencode.setApiKey"
             },
             {
                 "vendor": "gcmp.hyper",
-                "displayName": "GCMP · Charm Hyper",
+                "displayName": "GCMP · Charm Hyper Fork",
                 "managementCommand": "gcmp.hyper.setApiKey"
             },
             {
                 "vendor": "gcmp.clinepass",
-                "displayName": "GCMP · ClinePass",
+                "displayName": "GCMP · ClinePass Fork",
                 "managementCommand": "gcmp.clinepass.setApiKey"
             },
             {
                 "vendor": "gcmp.commandcode",
-                "displayName": "GCMP · CommandCode",
+                "displayName": "GCMP · CommandCode Fork",
                 "managementCommand": "gcmp.commandcode.setApiKey"
             },
             {
                 "vendor": "gcmp.codex",
-                "displayName": "GCMP · Codex CLI",
+                "displayName": "GCMP · Codex CLI Fork",
                 "managementCommand": "gcmp.codex.configWizard"
             },
             {
                 "vendor": "gcmp.grok",
-                "displayName": "GCMP · Grok Build",
+                "displayName": "GCMP · Grok Build Fork",
                 "managementCommand": "gcmp.grok.configWizard"
             },
             {
                 "vendor": "gcmp.compatible",
-                "displayName": "GCMP · Compatible",
+                "displayName": "GCMP · Compatible Fork",
                 "managementCommand": "gcmp.compatible.manageModels"
             }
         ],

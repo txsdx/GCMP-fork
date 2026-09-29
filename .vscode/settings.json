@@ -14,7 +14,7 @@
     // Enable proposed APIs for extension development
     "extensions.experimental.affinity": {
         "vscode.git": 1,
-        "vicanent.gcmp": 1
+        "vicanent.gcmp-fork": 1
     },
     // 编辑器配置：统一使用4个空格缩进
     "editor.tabSize": 4,

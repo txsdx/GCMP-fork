@@ -2,6 +2,20 @@
 
 本文档记录了 GCMP (AI Chat Models) 扩展的最近主要更改。
 
+## [0.28.4.1] - 2026-09-30
+
+### 新增
+
+- **Fork 独立扩展标识**：扩展包名称调整为 `gcmp-fork`、显示名调整为 `AI Chat Models Fork`，扩展 ID 为 `vicanent.gcmp-fork`，可与原版 GCMP 分别安装。
+- **Codex CLI 自定义 Provider 兼容**：新增 `gcmp.codex.allowCustomProviderWithoutUsage` 机器级开关；启用后读取 `~/.codex/config.toml` 当前自定义 `model_provider`、API Key 登录凭证及本地模型目录，在自定义服务不支持 ChatGPT 用量查询时仍注册并调用 Codex 模型。
+
+---
+
+### Added
+
+- **Independent Fork extension identity**: renamed the package to `gcmp-fork` and the display name to `AI Chat Models Fork`. Its extension ID is now `vicanent.gcmp-fork`, allowing it to be installed separately from the original GCMP extension.
+- **Codex CLI custom-provider compatibility**: added the machine-scoped `gcmp.codex.allowCustomProviderWithoutUsage` switch. When enabled, GCMP reads the active custom `model_provider`, API-key credentials, and local model catalog from `~/.codex/config.toml`, keeping Codex models registered and usable when the custom service has no ChatGPT usage endpoint.
+
 ## [0.28.4] - 2026-09-19
 
 ### 新增

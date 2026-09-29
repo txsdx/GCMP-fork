@@ -202,7 +202,7 @@ async function updateGlobalSetting<K extends 'machineOverrides' | 'providerOverr
 
 suite('machine overrides', () => {
     test('contributes a machine-scoped nested provider and model setting', () => {
-        const extension = vscode.extensions.getExtension('vicanent.gcmp');
+        const extension = vscode.extensions.getExtension('vicanent.gcmp-fork');
         assert.ok(extension);
 
         const configuration = extension.packageJSON.contributes?.configuration as ConfigurationContribution | undefined;
@@ -228,7 +228,7 @@ suite('machine overrides', () => {
         const workspaceFile = vscode.workspace.workspaceFile!;
         const editor = vscode.workspace.getConfiguration('editor', folder.uri);
         const originalTabSize = editor.inspect<number>('tabSize')?.workspaceValue;
-        const extension = vscode.extensions.getExtension('vicanent.gcmp');
+        const extension = vscode.extensions.getExtension('vicanent.gcmp-fork');
         assert.ok(extension);
         const discover = promisify(execFile);
 
@@ -263,7 +263,7 @@ suite('machine overrides', () => {
                         `--user-data-dir=${join(discovered.env.GCMP_TEST_ROOT, 'user-data')}`
                     )
                 );
-                assert.ok(discovered.config.launchArgs.includes('--enable-proposed-api=vicanent.gcmp'));
+                assert.ok(discovered.config.launchArgs.includes('--enable-proposed-api=vicanent.gcmp-fork'));
                 assert.equal(await readFile(workspaceFile.fsPath, 'utf8'), originalWorkspace);
             }
         } finally {
@@ -289,7 +289,7 @@ suite('machine overrides', () => {
                 configuration.inspect<GCMPConfig['machineOverrides']>('machineOverrides')?.globalValue;
             const originalProvider =
                 configuration.inspect<GCMPConfig['providerOverrides']>('providerOverrides')?.globalValue;
-            const extension = vscode.extensions.getExtension('vicanent.gcmp');
+            const extension = vscode.extensions.getExtension('vicanent.gcmp-fork');
             assert.ok(extension);
             const machineOverrides: GCMPConfig['machineOverrides'] = {
                 codex: {

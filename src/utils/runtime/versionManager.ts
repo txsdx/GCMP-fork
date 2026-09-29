@@ -16,7 +16,7 @@ export class VersionManager {
      */
     static getVersion(): string {
         if (this._version === null) {
-            const extension = vscode.extensions.getExtension('vicanent.gcmp');
+            const extension = vscode.extensions.getExtension('vicanent.gcmp-fork');
             this._version = extension?.packageJSON?.version || '0.4.0';
         }
         return this._version!;

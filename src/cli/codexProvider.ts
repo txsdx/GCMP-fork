@@ -16,6 +16,7 @@ import { getCodexTuiUserAgentFromHeader } from '../utils/net/cliUserAgent';
 import { ensureUserAgentHeader, mergeCustomHeaders } from '../utils/net/httpHeaders';
 import { withCodexCliMetadata } from '../utils/metadata/metadataResolver';
 import { parseCodexModelsResponse } from '../utils/model/codexModels';
+import { readCodexCliConfig, readCodexModelCatalog, resolveCodexCliProviderApiKey } from './codexCliConfig';
 
 /** Codex 后端模型列表 API 地址 */
 const CODEX_MODELS_URL = 'https://chatgpt.com/backend-api/codex/models';
@@ -69,6 +70,8 @@ export class CodexProvider extends CliBaseProvider {
     private dynamicModelGeneration = 0;
     /** 当前共享刷新是否已无等待者；刷新完成前不启动新的刷新 */
     private refreshCancellationRequested = false;
+    /** Active Codex CLI custom-provider snapshot; undefined keeps the ChatGPT OAuth behavior. */
+    private cliCustomProviderSignature?: string;
 
     /**
      * @param context 扩展上下文
@@ -81,9 +84,14 @@ export class CodexProvider extends CliBaseProvider {
         // 监听 providerOverrides 配置变化，变化时清除 globalState 缓存
         // 迫使下次请求重新拉取远端模型列表，确保覆盖配置立即生效
         this.codexConfigListener = vscode.workspace.onDidChangeConfiguration(event => {
-            if (event.affectsConfiguration('gcmp.providerOverrides')) {
+            if (
+                event.affectsConfiguration('gcmp.providerOverrides') ||
+                event.affectsConfiguration('gcmp.codex.allowCustomProviderWithoutUsage')
+            ) {
                 this.lastSuccessfulFetch = undefined;
                 void this.context.globalState.update(CACHE_KEY, undefined);
+                void this.modelInfoCache?.invalidateCache(this.providerKey);
+                this._onDidChangeLanguageModelChatInformation.fire();
             }
         });
         context.subscriptions.push(this.codexConfigListener);
@@ -100,6 +108,7 @@ export class CodexProvider extends CliBaseProvider {
             return;
         }
         this.staticProviderConfig = { ...this.staticProviderConfig, models };
+        this.cliCustomProviderSignature = undefined;
         this.lastSuccessfulFetch = undefined;
         this.dynamicModelGeneration++;
         this.currentAbortController?.abort();
@@ -158,8 +167,14 @@ export class CodexProvider extends CliBaseProvider {
         options: PrepareLanguageModelChatModelOptions & { silent: boolean },
         token: CancellationToken
     ): Promise<LanguageModelChatInformation[]> {
+        const usesCustomProvider = await this.syncCodexCliCustomProvider();
         const initialModels = await super.provideLanguageModelChatInformation(options, token);
-        if (options.configuration || initialModels.length === 0 || token.isCancellationRequested) {
+        if (
+            usesCustomProvider ||
+            options.configuration ||
+            initialModels.length === 0 ||
+            token.isCancellationRequested
+        ) {
             return initialModels;
         }
 
@@ -221,6 +236,73 @@ export class CodexProvider extends CliBaseProvider {
             }
             return infos;
         }
+    }
+
+    protected override allowStoredApiKeyWithoutCliCredentials(): boolean {
+        return this.cliCustomProviderSignature !== undefined;
+    }
+
+    /**
+     * Opt-in bridge for `~/.codex/config.toml` custom model providers.
+     * These providers generally do not expose ChatGPT subscription usage or its models endpoint,
+     * so their local catalog (or the bundled catalog) is used without probing either endpoint.
+     */
+    private async syncCodexCliCustomProvider(): Promise<boolean> {
+        const enabled = vscode.workspace
+            .getConfiguration('gcmp.codex')
+            .get<boolean>('allowCustomProviderWithoutUsage', false);
+        const cliConfig = enabled ? readCodexCliConfig() : null;
+
+        if (!cliConfig) {
+            if (this.cliCustomProviderSignature !== undefined) {
+                this.cliCustomProviderSignature = undefined;
+                this.baseProviderConfig = this.staticProviderConfig;
+                this.cachedProviderConfig = this.applyProviderConfigOverrides(this.staticProviderConfig);
+                await this.modelInfoCache?.invalidateCache(this.providerKey);
+            }
+            return false;
+        }
+
+        const catalogPayload = readCodexModelCatalog(cliConfig.modelCatalogPath);
+        const catalogModels = parseCodexModelsResponse(catalogPayload, this.staticProviderConfig.models);
+        const sourceModels = catalogModels.length > 0 ? catalogModels : this.staticProviderConfig.models;
+        const sdkMode: ModelConfig['sdkMode'] = cliConfig.provider.wireApi === 'chat' ? 'openai' : 'openai-responses';
+        const models = sourceModels.map(model => ({ ...model, sdkMode }));
+        const customBaseConfig: ProviderConfig = {
+            ...this.staticProviderConfig,
+            baseUrl: cliConfig.provider.baseUrl,
+            models
+        };
+        const signature = JSON.stringify({
+            provider: cliConfig.provider,
+            modelCatalogPath: cliConfig.modelCatalogPath,
+            models
+        });
+
+        if (signature !== this.cliCustomProviderSignature) {
+            this.cliCustomProviderSignature = signature;
+            this.baseProviderConfig = customBaseConfig;
+            this.cachedProviderConfig = this.applyProviderConfigOverrides(customBaseConfig);
+            this.lastSuccessfulFetch = undefined;
+            this.dynamicModelGeneration++;
+            this.currentAbortController?.abort();
+            await this.context.globalState.update(CACHE_KEY, undefined);
+            await this.modelInfoCache?.invalidateCache(this.providerKey);
+            Logger.info(
+                `[codex] Using Codex CLI custom provider ${cliConfig.provider.name ?? cliConfig.provider.id} (${cliConfig.provider.baseUrl})`
+            );
+        }
+
+        const configuredKey = resolveCodexCliProviderApiKey(cliConfig);
+        if (configuredKey) {
+            await ApiKeyManager.setApiKey('codex', configuredKey);
+        } else {
+            const credentials = await CliAuthFactory.loadCredentials('codex');
+            if (credentials?.access_token) {
+                await ApiKeyManager.setApiKey('codex', credentials.access_token);
+            }
+        }
+        return true;
     }
 
     /**
@@ -482,6 +564,6 @@ export class CodexProvider extends CliBaseProvider {
 
     /** 当前扩展版本号（用于缓存版本校验） */
     private get extensionVersion(): string {
-        return vscode.extensions.getExtension('vicanent.gcmp')?.packageJSON.version ?? '';
+        return vscode.extensions.getExtension('vicanent.gcmp-fork')?.packageJSON.version ?? '';
     }
 }

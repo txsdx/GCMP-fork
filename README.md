@@ -1,4 +1,4 @@
-# GCMP - 提供多个国内原生大模型提供商支持的扩展
+# GCMP Fork - 提供多个国内原生大模型提供商支持的扩展
 
 **[English](README.en.md)** | 中文
 
@@ -208,9 +208,11 @@ npm install -g @openai/codex@latest
 - **支持模型**：详见 [config/codex.json](src/providers/config/codex.json)。
 - **用量查询**：已支持状态栏显示 ChatGPT 订阅周期剩余用量，可查看订阅余量信息。
 - **独立代理设置**：可通过当前机器的 `gcmp.machineOverrides.codex.proxy` 单独指定 Codex 请求的代理地址，不影响其他机器。
+- **Codex CLI 自定义 Provider**：启用 `gcmp.codex.allowCustomProviderWithoutUsage` 后，GCMP 会使用 `~/.codex/config.toml` 当前 `model_provider` 的 `base_url`、`wire_api`、`model_catalog_json` 与 API Key 配置。即使该 Provider 不支持 ChatGPT 用量查询，Codex 模型仍会显示并可调用；此模式不显示 ChatGPT 订阅余量。
 
 ```json
 {
+    "gcmp.codex.allowCustomProviderWithoutUsage": true,
     "gcmp.machineOverrides": {
         "codex": {
             "proxy": "http://127.0.0.1:10808"
