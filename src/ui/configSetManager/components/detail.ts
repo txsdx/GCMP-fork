@@ -272,39 +272,84 @@ function renderSlotSection(pst: ProviderState, slotState: SlotState, opt: Provid
     slotHead.appendChild(slotTitle);
 
     const slotActions = el('div', 'csm-slot-actions');
-    const failoverLabel = el(
-        'label',
-        `csm-auto-switch${slotState.autoSwitchEnabled ? ' csm-auto-switch-enabled' : ''}`
-    );
-    failoverLabel.title = t(
-        slotState.rows.length < 2 && !slotState.autoSwitchEnabled ?
-            'Add at least 2 saved configurations before enabling automatic failover.'
-        :   'When enabled, any request error counts toward failover. After 3 consecutive failures, activate the next saved configuration. User cancellation does not count or stop a switch already started.',
-        slotState.rows.length < 2 && !slotState.autoSwitchEnabled ?
-            '至少添加 2 套已保存配置后才能开启自动故障切换。'
-        :   '开启后，任意请求错误均计入连续失败，达到 3 次后激活下一套配置；主动取消不计入，也不阻止已开始的切换。'
-    );
-    const failoverInput = el('input') as HTMLInputElement;
-    failoverInput.type = 'checkbox';
-    failoverInput.setAttribute('aria-label', t('Enable automatic API key failover', '启用 API Key 自动故障切换'));
-    failoverInput.checked = slotState.autoSwitchEnabled;
-    failoverInput.disabled = state.busy || (slotState.rows.length < 2 && !slotState.autoSwitchEnabled);
-    failoverInput.addEventListener('change', () => {
-        clearMessage();
-        state.busy = true;
-        render();
-        postToVSCode({ command: 'setAutoSwitch', slot: slotState.slot, enabled: failoverInput.checked });
-    });
-    failoverLabel.appendChild(failoverInput);
-    failoverLabel.appendChild(el('span', '', t('Auto failover', '自动故障切换')));
-    failoverLabel.appendChild(
-        el(
+    const switchTabs = el('div', 'csm-switch-tabs');
+    const switchModes: Array<{
+        mode: SlotState['switchMode'];
+        labelEn: string;
+        labelZh: string;
+        titleEn: string;
+        titleZh: string;
+    }> = [
+        {
+            mode: 'off',
+            labelEn: 'Off',
+            labelZh: '关闭',
+            titleEn: 'Switch configurations manually.',
+            titleZh: '仅手动切换配置。'
+        },
+        {
+            mode: 'failover',
+            labelEn: 'Failover',
+            labelZh: '故障切换',
+            titleEn:
+                'When enabled, any request error counts toward failover. After 3 consecutive failures, activate the next saved configuration. User cancellation does not count or stop a switch already started.',
+            titleZh:
+                '开启后，任意请求错误均计入连续失败，达到 3 次后激活下一套配置；主动取消不计入，也不阻止已开始的切换。'
+        },
+        {
+            mode: 'balance',
+            labelEn: 'Balance',
+            labelZh: '负载均衡',
+            titleEn:
+                'A Leader assigns chat sessions and sub-agent sub-sessions across saved configurations. If no Leader is available, requests use the primary API Key. A credential that fails 3 times in a row is avoided for 5 minutes.',
+            titleZh:
+                '由 Leader 将会话与子代理子会话分配到各套已保存配置；没有可用 Leader 时回退到主 API Key；凭据连续失败 3 次后隔离 5 分钟。'
+        }
+    ];
+    for (const switchMode of switchModes) {
+        const tab = el(
+            'button',
+            `csm-switch-tab${slotState.switchMode === switchMode.mode ? ' csm-switch-tab-active' : ''}`,
+            t(switchMode.labelEn, switchMode.labelZh)
+        );
+        tab.type = 'button';
+        tab.title =
+            slotState.rows.length < 2 && slotState.switchMode === 'off' && switchMode.mode !== 'off' ?
+                t('Add at least 2 saved configurations first.', '请先添加至少 2 套已保存配置。')
+            :   t(switchMode.titleEn, switchMode.titleZh);
+        tab.disabled =
+            state.busy || (slotState.rows.length < 2 && slotState.switchMode === 'off' && switchMode.mode !== 'off');
+        tab.setAttribute('aria-pressed', slotState.switchMode === switchMode.mode ? 'true' : 'false');
+        tab.addEventListener('click', () => {
+            if (switchMode.mode === slotState.switchMode) {
+                return;
+            }
+            clearMessage();
+            state.busy = true;
+            render();
+            postToVSCode({ command: 'setSwitchMode', slot: slotState.slot, mode: switchMode.mode });
+        });
+        switchTabs.appendChild(tab);
+    }
+    slotActions.appendChild(switchTabs);
+
+    if (slotState.switchMode === 'balance') {
+        const status = el(
             'span',
-            slotState.autoSwitchEnabled ? 'csm-auto-switch-status csm-auto-switch-status-on' : 'csm-auto-switch-status',
-            slotState.autoSwitchEnabled ? t('ON', '已开启') : t('OFF', '未开启')
-        )
-    );
-    slotActions.appendChild(failoverLabel);
+            `csm-balance-status csm-balance-status-${slotState.balanceStatus ?? 'fallback'}`,
+            slotState.balanceStatus === 'available' ?
+                t('Leader available', 'Leader 可用')
+            :   t('Primary key fallback', '已回退主 Key')
+        );
+        status.title =
+            slotState.balanceStatus === 'available' ?
+                t('Cross-instance balance allocation is active.', '跨实例均衡分配已启用。')
+            :   t(
+                    'No active Leader is available; requests use the primary API Key.',
+                    '当前没有可用 Leader，请求将使用主 API Key。'
+                );
+        slotActions.appendChild(status);
+    }
 
     const addBtn = el(
         'button',

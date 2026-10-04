@@ -3,14 +3,14 @@ import OpenAI from 'openai';
 
 import { ModelChatResponseOptions, ModelConfig, NativeToolConfig } from '../../types/sharedTypes';
 import { Logger } from '../../utils/runtime/logger';
-import { isSubRequest, type RequestKind } from '../requestClassifier';
+import { isSubRequest, shouldDisableThinkingForRequest, type RequestKind } from '../requestClassifier';
 import { canDisableThinking } from '../thinkingSupport';
 import { mergeNativeToolConfigs } from '../nativeToolUtils';
 import { OpenAIResponsesMessageConverter } from './openaiResponsesMessageConverter';
 import { preprocessOpenAIResponsesInputItems } from './openaiResponsesInputPreprocessor';
 import { ENCRYPTED_REASONING_INCLUDE, isEncryptedReasoningEnabled } from './encryptedReasoning';
 import { applyOpenAIServiceTier } from './serviceTier';
-import { replaceSessionIdInBody } from '../../utils/text/formatUtils';
+import { removeNullExtraBodyParams, replaceSessionIdInBody } from '../../utils/text/formatUtils';
 
 interface OpenAIResponsesRequestBuilderParams {
     model: vscode.LanguageModelChatInformation;
@@ -91,7 +91,6 @@ export class OpenAIResponsesRequestBuilder {
         const requestKind = (options.modelOptions as { requestKind?: string } | undefined)?.requestKind as
             | RequestKind
             | undefined;
-        const disableThinkingByRequestKind = requestKind !== undefined && isSubRequest(requestKind);
         const { systemMessage, messages: responsesMessages } = this.messageConverter.convertMessagesToOpenAIResponses(
             messages,
             modelConfig,
@@ -122,12 +121,13 @@ export class OpenAIResponsesRequestBuilder {
             );
         }
         this.applyDeclaredTools(requestBody, options);
-        if (!disableThinkingByRequestKind) {
+        if (!requestKind || !isSubRequest(requestKind)) {
             this.applyNativeTools(requestBody, modelConfig);
         }
-        this.applyExtraBody(requestBody, modelConfig, sessionId);
-        this.applyModelSettings(requestBody, model, modelConfig, modelId, options, requestKind);
+        const filteredExtraBody = this.applyExtraBody(requestBody, modelConfig, sessionId);
+        this.applyModelSettings(requestBody, modelConfig, modelId, options, requestKind);
         this.preprocessInputAndTools(requestBody);
+        removeNullExtraBodyParams(requestBody, filteredExtraBody);
 
         return { requestBody };
     }
@@ -195,7 +195,11 @@ export class OpenAIResponsesRequestBuilder {
         return entry;
     }
 
-    private applyExtraBody(requestBody: Record<string, unknown>, modelConfig: ModelConfig, sessionId = ''): void {
+    private applyExtraBody(
+        requestBody: Record<string, unknown>,
+        modelConfig: ModelConfig,
+        sessionId = ''
+    ): Record<string, unknown> | undefined {
         if (!modelConfig?.extraBody) {
             return;
         }
@@ -204,11 +208,11 @@ export class OpenAIResponsesRequestBuilder {
             replaceSessionIdInBody(modelConfig.extraBody, sessionId)
         );
         Object.assign(requestBody, filteredExtraBody);
+        return filteredExtraBody;
     }
 
     private applyModelSettings(
         requestBody: Record<string, unknown>,
-        model: vscode.LanguageModelChatInformation,
         modelConfig: ModelConfig,
         modelId: string,
         options: vscode.ProvideLanguageModelChatResponseOptions,
@@ -255,14 +259,14 @@ export class OpenAIResponsesRequestBuilder {
                     }
                     customParams.thinking = thinking;
                     customParams.reasoning = reasoning;
-                    if (model.id.toLowerCase().includes('gpt')) {
+                    if (modelId.includes('gpt')) {
                         customParams.thinking = undefined;
                     }
                 }
             }
         }
 
-        if (effortOnly || !requestKind || !isSubRequest(requestKind)) {
+        if (effortOnly || !shouldDisableThinkingForRequest(requestKind)) {
             return;
         }
 

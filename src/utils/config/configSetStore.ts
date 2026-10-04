@@ -27,6 +27,25 @@ export interface ConfigSetItem {
 }
 
 /**
+ * 配置集切换模式：
+ * - off：关闭自动切换
+ * - failover：故障切换（连续失败达阈值后全局轮换激活配置）
+ * - balance：负载均衡（按会话/子代理哈希分配 Key，失败 Key 按单元隔离后恢复）
+ */
+export type ConfigSetSwitchMode = 'off' | 'failover' | 'balance';
+
+/** 负载均衡模式下某平衡单元对请求凭据的隔离记录（TTL 由消费方判定） */
+export interface BalanceKeyExclusion {
+    /** 平衡键（s:{sessionId} 或 a:{subSessionId}） */
+    k: string;
+    /** 请求 Key 与站点的不可逆指纹 */
+    credentialId: string;
+    /** 隔离发生时间戳 */
+    at: number;
+    authorityTerm?: string;
+}
+
+/**
  * 配置集存储（per-slot）
  */
 export class ConfigSetStore {
@@ -34,6 +53,10 @@ export class ConfigSetStore {
 
     static initialize(context: vscode.ExtensionContext): void {
         this.context = context;
+    }
+
+    static isInitialized(): boolean {
+        return !!this.context;
     }
 
     private static readonly INDEX_KEY = 'configSets';
@@ -54,6 +77,45 @@ export class ConfigSetStore {
     private static autoSwitchKey(slot: string): string {
         return `configSets.autoSwitch.${slot}`;
     }
+
+    private static switchModeKey(slot: string): string {
+        return `configSets.switchMode.${slot}`;
+    }
+
+    private static balanceExclusionsKey(slot: string): string {
+        return `configSets.balanceExclusions.${slot}`;
+    }
+
+    private static balanceExclusionTermPrefix(slot: string): string {
+        return `${this.balanceExclusionsKey(slot)}.term.`;
+    }
+
+    private static balanceExclusionTermKey(slot: string, authorityTerm: string): string {
+        return `${this.balanceExclusionTermPrefix(slot)}${crypto.createHash('sha256').update(authorityTerm).digest('hex')}`;
+    }
+
+    private static balanceExclusionStorageKeys(slot: string): string[] {
+        const legacyKey = this.balanceExclusionsKey(slot);
+        const termPrefix = this.balanceExclusionTermPrefix(slot);
+        return [legacyKey, ...this.context.globalState.keys().filter(key => key.startsWith(termPrefix))];
+    }
+
+    private static readBalanceExclusionsKey(key: string): BalanceKeyExclusion[] {
+        const value = this.context.globalState.get<BalanceKeyExclusion[]>(key);
+        return Array.isArray(value) ?
+                value.filter(
+                    entry =>
+                        typeof entry?.k === 'string' &&
+                        typeof entry?.credentialId === 'string' &&
+                        typeof entry?.at === 'number' &&
+                        Number.isFinite(entry.at) &&
+                        (entry.authorityTerm === undefined || typeof entry.authorityTerm === 'string')
+                )
+            :   [];
+    }
+
+    private static readonly BALANCE_EXCLUSION_MAX = 500;
+    private static readonly BALANCE_EXCLUSION_TTL_MS = 5 * 60 * 1000;
 
     private static applyOperationKey(slot: string): string {
         return `configSets.applyOperation.${slot}`;
@@ -172,12 +234,36 @@ export class ConfigSetStore {
         if (!this.context) {
             return false;
         }
-        return this.context.globalState.get<boolean>(this.autoSwitchKey(slot), false);
+        return this.getSwitchMode(slot) !== 'off';
     }
 
-    static async setAutoSwitchEnabled(slot: string, enabled: boolean, operationToken?: string): Promise<void> {
+    static getSwitchMode(slot: string): ConfigSetSwitchMode {
+        if (!this.context) {
+            return 'off';
+        }
+        const mode = this.context.globalState.get<ConfigSetSwitchMode>(this.switchModeKey(slot));
+        if (mode === 'failover' || mode === 'balance') {
+            return mode;
+        }
+        // 旧版本仅有布尔开关：启用即等价于故障切换模式
+        return this.context.globalState.get<boolean>(this.autoSwitchKey(slot), false) ? 'failover' : 'off';
+    }
+
+    static async setSwitchMode(slot: string, mode: ConfigSetSwitchMode, operationToken?: string): Promise<void> {
         const update = async (): Promise<void> => {
-            await this.context.globalState.update(this.autoSwitchKey(slot), enabled || undefined);
+            await this.context.globalState.update(this.switchModeKey(slot), mode === 'off' ? undefined : mode);
+            // 写入新模式即完成旧布尔键迁移，避免旧实例回读legacy值
+            await this.context.globalState.update(this.autoSwitchKey(slot), undefined);
+            if (mode === 'balance') {
+                await this.cleanupBalanceExclusionsUnlocked(slot, Date.now());
+            } else {
+                await this.context.globalState.update(this.balanceExclusionsKey(slot), undefined);
+                for (const key of this.balanceExclusionStorageKeys(slot)) {
+                    if (key !== this.balanceExclusionsKey(slot)) {
+                        await this.context.globalState.update(key, undefined);
+                    }
+                }
+            }
         };
         if (operationToken) {
             if (this.getApplyOperationToken(slot) !== operationToken) {
@@ -190,10 +276,56 @@ export class ConfigSetStore {
         try {
             InterInstanceBus.publish({
                 type: 'apiKeyFailoverToggled',
-                payload: { slot, enabled }
+                payload: { slot, enabled: mode !== 'off', mode }
             });
         } catch (error) {
-            Logger.warn(`[ConfigSetStore] Failed to publish automatic failover change for ${slot}:`, error);
+            Logger.warn(`[ConfigSetStore] Failed to publish switch mode change for ${slot}:`, error);
+        }
+    }
+
+    static async setAutoSwitchEnabled(slot: string, enabled: boolean, operationToken?: string): Promise<void> {
+        await this.setSwitchMode(slot, enabled ? 'failover' : 'off', operationToken);
+    }
+
+    static getBalanceExclusions(slot: string): BalanceKeyExclusion[] {
+        if (!this.context) {
+            return [];
+        }
+        return this.balanceExclusionStorageKeys(slot).flatMap(key => this.readBalanceExclusionsKey(key));
+    }
+
+    static async cleanupBalanceExclusions(slot: string, now = Date.now()): Promise<void> {
+        await this.enqueue(() => this.cleanupBalanceExclusionsUnlocked(slot, now));
+    }
+
+    static async addBalanceExclusion(
+        slot: string,
+        balanceKey: string,
+        credentialId: string,
+        at: number,
+        authorityTerm?: string
+    ): Promise<void> {
+        const storageKey =
+            authorityTerm ? this.balanceExclusionTermKey(slot, authorityTerm) : this.balanceExclusionsKey(slot);
+        await this.enqueue(async () => {
+            await this.cleanupBalanceExclusionsUnlocked(slot, Date.now());
+            const next = this.readBalanceExclusionsKey(storageKey).filter(
+                entry => !(entry.k === balanceKey && entry.credentialId === credentialId)
+            );
+            next.push({ k: balanceKey, credentialId, at, ...(authorityTerm ? { authorityTerm } : {}) });
+            while (next.length > this.BALANCE_EXCLUSION_MAX) {
+                next.shift();
+            }
+            await this.context.globalState.update(storageKey, next.length > 0 ? next : undefined);
+        });
+    }
+
+    private static async cleanupBalanceExclusionsUnlocked(slot: string, now: number): Promise<void> {
+        for (const key of this.balanceExclusionStorageKeys(slot)) {
+            const fresh = this.readBalanceExclusionsKey(key).filter(
+                entry => now - entry.at <= this.BALANCE_EXCLUSION_TTL_MS
+            );
+            await this.context.globalState.update(key, fresh.length > 0 ? fresh : undefined);
         }
     }
 

@@ -26,7 +26,7 @@ import {
     toCostBreakdownLog
 } from '../../utils/pricing/costCalculator';
 import { VersionManager } from '../../utils/runtime/versionManager';
-import { createOpenCodeHeaders, replaceSessionIdInBody } from '../../utils/text/formatUtils';
+import { createOpenCodeHeaders, removeNullExtraBodyParams, replaceSessionIdInBody } from '../../utils/text/formatUtils';
 import { TokenUsagesManager } from '../../usages/usagesManager';
 import { t } from '../../utils/runtime/l10n';
 import type {
@@ -41,7 +41,7 @@ import { StreamReporter } from '../streamReporter';
 import { mergeNativeToolConfigs } from '../nativeToolUtils';
 import * as liveMetrics from '../liveMetrics';
 import type { GenericModelProvider } from '../../providers/genericModelProvider';
-import { isSubRequest, type RequestKind } from '../requestClassifier';
+import { shouldDisableThinkingForRequest, type RequestKind } from '../requestClassifier';
 import { applyAnthropicThinkingConfiguration } from './anthropicThinkingConfig';
 import { applyAnthropicServiceTier } from './serviceTier';
 
@@ -269,6 +269,7 @@ export class AnthropicHandler {
             createParams.metadata = { user_id: `user_${this.userHash}_account__session_${sessionId}` };
 
             // 合并 extraBody 参数（如果有）
+            let filteredExtraBody: Record<string, unknown> | undefined;
             if (modelConfig.extraBody) {
                 // 顶层 cache_control 属于官方 automatic caching，会与注入的 4 个块级断点
                 // 叠加超限或混 TTL 导致 400；TTL 请改用模型配置 cacheTtl（#370）
@@ -282,7 +283,7 @@ export class AnthropicHandler {
                     );
                 }
                 // 过滤掉不可修改的核心参数
-                const filteredExtraBody = OpenAIHandler.filterExtraBodyParams(
+                filteredExtraBody = OpenAIHandler.filterExtraBodyParams(
                     replaceSessionIdInBody(extraBodyWithoutCacheControl, sessionId)
                 );
                 Object.assign(createParams, filteredExtraBody);
@@ -295,9 +296,8 @@ export class AnthropicHandler {
             // 根据模型配置设置思考模式和推理长度
             const settings = options.modelConfiguration as ModelChatResponseOptions;
             applyAnthropicThinkingConfiguration(createParams, settings, modelConfig);
-            // 子请求（提交、标题生成、终端解释等）关闭思考
             const requestKind = (options.modelOptions as { requestKind?: RequestKind })?.requestKind;
-            if (requestKind && isSubRequest(requestKind)) {
+            if (shouldDisableThinkingForRequest(requestKind)) {
                 applyAnthropicThinkingConfiguration(createParams, undefined, modelConfig, { disableThinking: true });
             }
 
@@ -327,6 +327,7 @@ export class AnthropicHandler {
                 },
                 modelConfig.cacheTtl
             );
+            removeNullExtraBodyParams(createParams, filteredExtraBody);
 
             Logger.debug(
                 `[${model.name}] Sending Anthropic API request with ${anthropicMessages.length} messages, model: ${modelId}`
@@ -355,6 +356,7 @@ export class AnthropicHandler {
                 sdkMode: 'anthropic',
                 progress,
                 sessionId,
+                subSessionId: (options.modelOptions as { subSessionId?: string })?.subSessionId,
                 requestId,
                 requestStartTime: requestMetricStartTime,
                 onLiveMetrics: event => liveMetrics.emitLiveMetrics(event)

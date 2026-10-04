@@ -44,6 +44,7 @@ import { getAllStatefulMarkersAndIndicies } from '../handlers/statefulMarker';
 import { classifyRequest } from '../handlers/requestClassifier';
 import { SessionTitleService } from '../usages/sessionTitleService';
 import { SessionRecoveryService } from '../usages/sessionRecoveryService';
+import { resolveSubSessionId } from '../usages/subSessionResolver';
 import { VisionCache } from '../tools/vision/cache';
 import { processVisionMessages } from '../tools/vision/messageProcessor';
 import { StatusBarManager } from '../status/statusBarManager';
@@ -72,6 +73,8 @@ interface RuntimeModelOptionsTelemetry {
     _telemetryTurn?: number;
     /** 运行时注入的请求来源类型，供 handler 消费 */
     requestKind?: string;
+    /** 子会话 ID（仅子代理请求），handler 随 StatefulMarker 回写 */
+    subSessionId?: string;
 }
 
 type RuntimeProvideLanguageModelChatResponseOptions = ProvideLanguageModelChatResponseOptions & {
@@ -80,6 +83,22 @@ type RuntimeProvideLanguageModelChatResponseOptions = ProvideLanguageModelChatRe
 
 function isSubagentRequestKind(requestKind?: string): boolean {
     return requestKind === 'search-subagent' || requestKind === 'execution-subagent';
+}
+
+function getMainAgentBalanceKey(
+    sessionId: string,
+    messages: readonly LanguageModelChatMessage[],
+    requestKind: string
+): string {
+    if (requestKind !== 'main-agent') {
+        return `s:${sessionId}`;
+    }
+    const userText = SessionTitleService.extractLatestUserRequestText(messages);
+    if (!userText) {
+        return `s:${sessionId}`;
+    }
+    const digest = crypto.createHash('sha256').update(userText.replace(/\s+/g, ' ').trim()).digest('hex');
+    return `m:${sessionId}:${digest}`;
 }
 
 function shouldPublishResolvedCrossProviderTraceHint(requestKind?: string): boolean {
@@ -104,6 +123,7 @@ interface EstimatedRequestTrackingParams {
     maxInputTokens?: number;
     requestKind?: string;
     sessionId: string;
+    subSessionId: string | undefined;
     sessionRecoverySource?: SessionRecoverySource;
     options: ProvideLanguageModelChatResponseOptions;
     timestamp?: number;
@@ -112,6 +132,8 @@ interface EstimatedRequestTrackingParams {
 interface PreparedTrackedRequestContext extends ContextUsageSummary {
     requestKind: string;
     sessionId: string;
+    subSessionId?: string;
+    balanceKey: string;
     sessionRecoverySource: SessionRecoverySource;
     sdkMode: NonNullable<ModelConfig['sdkMode']> | 'openai';
 }
@@ -384,12 +406,23 @@ export class GenericModelProvider implements LanguageModelChatProvider {
             options,
             this.getProviderKeyForModel(modelConfig)
         );
+        const subSessionId =
+            isSubagentRequestKind(requestKind) ?
+                resolveSubSessionId(messages, sessionId, requestKind, sessionRecoverySource !== 'new-uuid')
+            :   undefined;
+        if (subSessionId) {
+            const rtOpts = options as RuntimeProvideLanguageModelChatResponseOptions;
+            rtOpts.modelOptions = rtOpts.modelOptions || {};
+            rtOpts.modelOptions.subSessionId = subSessionId;
+        }
         await this.prepareRequestSession(sessionId, messages, {
             skipHistoricalHydrate: sessionRecoverySource === 'new-uuid'
         });
         return {
             requestKind,
             sessionId,
+            subSessionId,
+            balanceKey: subSessionId ? `a:${subSessionId}` : getMainAgentBalanceKey(sessionId, messages, requestKind),
             sessionRecoverySource,
             sdkMode,
             totalInputTokens,
@@ -686,8 +719,9 @@ export class GenericModelProvider implements LanguageModelChatProvider {
         effectiveProviderKey = modelConfig.provider || this.providerKey,
         requestStartTime = Date.now(),
         totalInputTokens = 0,
-        onAttemptStarted?: (requestMetricStartTime: number) => void,
-        onThrottled?: () => void
+        onAttemptStarted: ((requestMetricStartTime: number) => void) | undefined,
+        onThrottled: (() => void) | undefined,
+        balanceKey: string
     ): Promise<void> {
         const baseModelConfig = modelConfig;
         const sdkMode = modelConfig.sdkMode || 'openai';
@@ -719,11 +753,14 @@ export class GenericModelProvider implements LanguageModelChatProvider {
         const attemptedFailoverIdentities = new Set<string>();
         let failoverFailureCount = 0;
         let failoverFailureIdentity: string | undefined;
+        let failoverFailureMode: ApiKeyFailoverAttempt['mode'] | undefined;
         let retryAttempt = 0;
         let initialFailoverConfigId: string | undefined;
         let returnedToInitial = false;
         let failoverFailureReported = false;
         let failoverFailureRequestId = crypto.randomUUID();
+        const balanceAllocationRequestId = crypto.randomUUID();
+        let balanceLeaseId: string | undefined;
 
         // 请求是否受过节流控制（限流等待/排队，跨 retry 累积）。
         let wasThrottled = false;
@@ -813,8 +850,29 @@ export class GenericModelProvider implements LanguageModelChatProvider {
                         if (token.isCancellationRequested) {
                             throw new vscode.CancellationError();
                         }
-                        failoverAttempt = await ApiKeyFailoverManager.captureAttempt(effectiveProviderKey);
-                        if (failoverAttempt?.identity !== failoverFailureIdentity) {
+                        failoverAttempt = await ApiKeyFailoverManager.captureAttempt(
+                            effectiveProviderKey,
+                            balanceKey,
+                            balanceAllocationRequestId
+                        );
+                        const nextBalanceLeaseId = failoverAttempt?.balanceLeaseId;
+                        if (balanceLeaseId && balanceLeaseId !== nextBalanceLeaseId) {
+                            ApiKeyFailoverManager.releaseBalanceLease(balanceLeaseId);
+                            balanceLeaseId = undefined;
+                        }
+                        if (nextBalanceLeaseId && failoverAttempt) {
+                            balanceLeaseId = nextBalanceLeaseId;
+                            ApiKeyFailoverManager.startBalanceLeaseHeartbeat(failoverAttempt, effectiveProviderKey);
+                        }
+                        if (
+                            failoverAttempt?.identity !== failoverFailureIdentity ||
+                            failoverAttempt?.mode !== failoverFailureMode
+                        ) {
+                            if (failoverAttempt?.mode !== failoverFailureMode) {
+                                attemptedFailoverIdentities.clear();
+                                initialFailoverConfigId = undefined;
+                                returnedToInitial = false;
+                            }
                             if (failoverFailureReported) {
                                 ApiKeyFailoverManager.resetFailureCount(effectiveProviderKey, failoverFailureRequestId);
                                 failoverFailureReported = false;
@@ -822,6 +880,7 @@ export class GenericModelProvider implements LanguageModelChatProvider {
                             }
                             failoverFailureCount = 0;
                             failoverFailureIdentity = failoverAttempt?.identity;
+                            failoverFailureMode = failoverAttempt?.mode;
                         }
                         initialFailoverConfigId ??= failoverAttempt?.activeId;
                         const siteProvider = getSiteOwnerProvider(effectiveProviderKey);
@@ -963,9 +1022,16 @@ export class GenericModelProvider implements LanguageModelChatProvider {
                                 undefined,
                                 failoverFailureRequestId,
                                 undefined,
-                                token
+                                token,
+                                balanceKey
                             );
                             if (decision.switched) {
+                                if (failoverAttempt.balanceLeaseId) {
+                                    ApiKeyFailoverManager.releaseBalanceLease(failoverAttempt.balanceLeaseId);
+                                    if (balanceLeaseId === failoverAttempt.balanceLeaseId) {
+                                        balanceLeaseId = undefined;
+                                    }
+                                }
                                 ApiKeyFailoverManager.resetFailureCount(effectiveProviderKey, failoverFailureRequestId);
                                 failoverFailureRequestId = crypto.randomUUID();
                                 failoverFailureReported = false;
@@ -1067,6 +1133,10 @@ export class GenericModelProvider implements LanguageModelChatProvider {
                 }
             }
         } finally {
+            if (balanceLeaseId) {
+                ApiKeyFailoverManager.releaseBalanceLease(balanceLeaseId);
+                balanceLeaseId = undefined;
+            }
             retryMessageDisposable?.dispose();
             retryMessageDisposable = undefined;
 
@@ -1133,6 +1203,8 @@ export class GenericModelProvider implements LanguageModelChatProvider {
             maxInputTokens,
             estimatedIncrement,
             sessionId,
+            subSessionId,
+            balanceKey,
             sessionRecoverySource,
             sdkMode
         } = await this.prepareTrackedRequestContext(model, modelConfig, messages, options);
@@ -1169,6 +1241,7 @@ export class GenericModelProvider implements LanguageModelChatProvider {
                 maxInputTokens,
                 requestKind,
                 sessionId,
+                subSessionId,
                 sessionRecoverySource,
                 options,
                 timestamp: requestStartTime
@@ -1191,7 +1264,8 @@ export class GenericModelProvider implements LanguageModelChatProvider {
                 },
                 () => {
                     wasThrottled = true;
-                }
+                },
+                balanceKey
             );
         } catch (error) {
             // 取消请求不应记为失败：handler 已记录 cancelled，或在此兜底记录
@@ -1420,6 +1494,7 @@ export class GenericModelProvider implements LanguageModelChatProvider {
                 maxInputTokens: params.maxInputTokens,
                 requestKind: params.requestKind,
                 sessionId: params.sessionId,
+                subSessionId: params.subSessionId,
                 sessionRecoverySource: params.sessionRecoverySource ?? 'new-uuid',
                 sessionTitle: SessionTitleService.instance.getTitle(params.sessionId),
                 timestamp: params.timestamp,

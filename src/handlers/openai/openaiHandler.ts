@@ -9,7 +9,7 @@ import { Logger } from '../../utils/runtime/logger';
 import { copyFinalStatusRecorded, markFinalStatusRecorded } from '../../utils/runtime/finalStatusMarker';
 import { VersionManager } from '../../utils/runtime/versionManager';
 import { sanitizeToolSchema } from '../../utils/text/schemaSanitizer';
-import { createOpenCodeHeaders, replaceSessionIdInBody } from '../../utils/text/formatUtils';
+import { createOpenCodeHeaders, removeNullExtraBodyParams, replaceSessionIdInBody } from '../../utils/text/formatUtils';
 import { redactHeaders } from '../../utils/net/proxyAgent';
 import {
     canonicalizeUserAgentHeader,
@@ -35,7 +35,7 @@ import { decodeStatefulMarker } from '../statefulMarker';
 import { shouldInjectReasoningPlaceholder } from '../reasoningPlaceholder';
 import { CustomDataPartMimeTypes, GCMP_SYSTEM_MESSAGE_NAME } from '../types';
 import type { GenericModelProvider } from '../../providers/genericModelProvider';
-import { isSubRequest, type RequestKind } from '../requestClassifier';
+import { shouldDisableThinkingForRequest, type RequestKind } from '../requestClassifier';
 import { preprocessOpenAIChatRequest } from './openaiChatRequestPreprocessor';
 import { applyOpenAIServiceTier } from './serviceTier';
 import { reportChatCompletionText } from './openaiChatStreamText';
@@ -846,8 +846,9 @@ export class OpenAIHandler {
         }
 
         // 合并 extraBody 参数（如果有），过滤掉不可修改的核心参数
+        let filteredExtraBody: Record<string, unknown> | undefined;
         if (modelConfig.extraBody) {
-            const filteredExtraBody = OpenAIHandler.filterExtraBodyParams(
+            filteredExtraBody = OpenAIHandler.filterExtraBodyParams(
                 replaceSessionIdInBody(modelConfig.extraBody, sessionId ?? '')
             );
             Object.assign(createParams, filteredExtraBody);
@@ -928,8 +929,13 @@ export class OpenAIHandler {
                     customParams.thinking = undefined;
                     customParams.enable_thinking = undefined;
                 } else if (effectiveReasoningEffort === 'none') {
-                    if (modelConfig.thinkingFormat === 'effort-none') {
-                        // effort-none 模式：直接通过 effort 参数传递 none
+                    if (
+                        modelConfig.thinkingFormat === 'effort-none' ||
+                        (modelConfig.thinkingFormat === undefined &&
+                            effectiveThinking === undefined &&
+                            customParams.enable_thinking === undefined)
+                    ) {
+                        // 缺省格式不代表端点支持 enable_thinking。
                         if (reasoningFormat === 'nested') {
                             customParams.reasoning = { effort: 'none' };
                         } else {
@@ -943,7 +949,7 @@ export class OpenAIHandler {
                         }
                         if (modelConfig.thinkingFormat === 'object' || modelConfig.thinkingFormat === 'object-none') {
                             customParams.thinking = { type: 'disabled' };
-                        } else if (modelConfig.thinkingFormat === 'boolean-none') {
+                        } else if (thinkingFormat === 'boolean' || thinkingFormat === 'boolean-none') {
                             customParams.enable_thinking = false;
                         }
                     }
@@ -962,12 +968,11 @@ export class OpenAIHandler {
                 }
             }
         }
-        // 子请求（提交、标题生成、终端解释等）关闭思考
         const requestKind = (options.modelOptions as { requestKind?: RequestKind })?.requestKind;
         const isDisableThinking =
             !effortOnly &&
             (requestKind === 'git-commit-message' ||
-                (settings?.thinking && requestKind !== undefined && isSubRequest(requestKind)));
+                (settings?.thinking && shouldDisableThinkingForRequest(requestKind)));
         if (isDisableThinking) {
             if (reasoningFormat === 'nested') {
                 customParams.reasoning = undefined;
@@ -1007,6 +1012,8 @@ export class OpenAIHandler {
             createParams.messages as unknown as { tool_calls?: { function?: { arguments?: unknown } }[] }[],
             createParams.tools as unknown as { function?: { parameters?: unknown } }[] | undefined
         );
+
+        removeNullExtraBodyParams(createParams, filteredExtraBody);
 
         return createParams;
     }
@@ -1074,6 +1081,7 @@ export class OpenAIHandler {
                     sdkMode: 'openai',
                     progress,
                     sessionId,
+                    subSessionId: (options.modelOptions as { subSessionId?: string })?.subSessionId,
                     requestId,
                     requestStartTime: requestMetricStartTime,
                     onLiveMetrics: event => liveMetrics.emitLiveMetrics(event)

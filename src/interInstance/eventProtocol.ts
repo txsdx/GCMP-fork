@@ -66,6 +66,8 @@ export interface ApiKeyFailoverToggledEvent extends InterInstanceEventBase {
         slot: string;
         /** 是否启用自动故障切换 */
         enabled: boolean;
+        /** 三态切换模式（enabled 的精确化，旧事件可缺省） */
+        mode?: 'off' | 'failover' | 'balance';
     };
 }
 
@@ -113,6 +115,78 @@ export interface ApiKeyFailoverResolvedEvent extends InterInstanceEventBase {
         shouldRetry: boolean;
         switched: boolean;
         switchedToInitial?: boolean;
+    };
+}
+
+export interface ApiKeyBalanceAssignmentRequestedEvent extends InterInstanceEventBase {
+    type: 'apiKeyBalanceAssignmentRequested';
+    payload: {
+        requestId: string;
+        requestedBy: string;
+        authorityTerm: string;
+        slot: string;
+        balanceKey: string;
+    };
+}
+
+export interface ApiKeyBalanceAssignmentResolvedEvent extends InterInstanceEventBase {
+    type: 'apiKeyBalanceAssignmentResolved';
+    payload: {
+        requestId: string;
+        targetInstanceId: string;
+        authorityTerm: string;
+        handled: boolean;
+        leaseId?: string;
+        configId?: string;
+        credentialId?: string;
+        site?: string;
+        apiKeyName?: string;
+        expiresAt?: number;
+    };
+}
+
+/**
+ * 向 Leader 上报负载均衡凭据连续失败，由 Leader 统一写入隔离状态。
+ */
+export interface ApiKeyBalanceFailureReportedEvent extends InterInstanceEventBase {
+    type: 'apiKeyBalanceFailureReported';
+    payload: {
+        requestId: string;
+        requestedBy: string;
+        authorityTerm: string;
+        slot: string;
+        balanceKey: string;
+        credentialId: string;
+        leaseId: string;
+        consecutiveFailureCount: number;
+    };
+}
+
+export interface ApiKeyBalanceFailureResolvedEvent extends InterInstanceEventBase {
+    type: 'apiKeyBalanceFailureResolved';
+    payload: {
+        requestId: string;
+        targetInstanceId: string;
+        authorityTerm: string;
+        handled: boolean;
+        shouldRetry: boolean;
+        switched: boolean;
+    };
+}
+
+export interface ApiKeyBalanceLeaseRenewedEvent extends InterInstanceEventBase {
+    type: 'apiKeyBalanceLeaseRenewed';
+    payload: {
+        leaseId: string;
+        authorityTerm: string;
+    };
+}
+
+export interface ApiKeyBalanceLeaseReleasedEvent extends InterInstanceEventBase {
+    type: 'apiKeyBalanceLeaseReleased';
+    payload: {
+        leaseId: string;
+        authorityTerm: string;
     };
 }
 
@@ -169,6 +243,21 @@ export interface LeaderChangedEvent extends InterInstanceEventBase {
     };
 }
 
+export interface ApiKeyBalanceLeaseHandoff {
+    sourceAuthorityTerm: string;
+    capturedAt: number;
+    leases: Array<{
+        leaseId: string;
+        slot: string;
+        balanceKey: string;
+        configId: string;
+        credentialId: string;
+        site?: string;
+        ownerInstanceId: string;
+        expiresAt: number;
+    }>;
+}
+
 /**
  * Leader 即将卸任
  * Leader 实例关闭前广播此事件，提示 Follower 立即开始新 Leader 竞选，
@@ -181,10 +270,14 @@ export interface LeaderResigningEvent extends InterInstanceEventBase {
     payload: {
         /** 卸任 Leader 的实例 ID */
         leaderId: string;
+        /** 卸任 Leader 当前 authority term */
+        sourceAuthorityTerm?: string;
         /** 建议的下一任 Leader 实例 ID（可选） */
         nextLeaderId?: string;
         /** 平滑切主用的限流权威桶快照（可选） */
         rateLimitSnapshot?: RateLimitStoreSnapshot;
+        /** 平滑切主用的 API Key balance 租约快照（可选） */
+        balanceLeaseSnapshot?: ApiKeyBalanceLeaseHandoff;
     };
 }
 
@@ -483,6 +576,12 @@ export type InterInstanceEvent =
     | ApiKeyFailoverRequestedEvent
     | ApiKeyFailoverResetEvent
     | ApiKeyFailoverResolvedEvent
+    | ApiKeyBalanceAssignmentRequestedEvent
+    | ApiKeyBalanceAssignmentResolvedEvent
+    | ApiKeyBalanceFailureReportedEvent
+    | ApiKeyBalanceFailureResolvedEvent
+    | ApiKeyBalanceLeaseRenewedEvent
+    | ApiKeyBalanceLeaseReleasedEvent
     | ConfigChangedEvent
     | TokenUsageUpdatedEvent
     | RemoteMetadataUpdatedEvent
@@ -517,6 +616,12 @@ export const INTER_INSTANCE_EVENT_TYPES = [
     'apiKeyFailoverRequested',
     'apiKeyFailoverReset',
     'apiKeyFailoverResolved',
+    'apiKeyBalanceAssignmentRequested',
+    'apiKeyBalanceAssignmentResolved',
+    'apiKeyBalanceFailureReported',
+    'apiKeyBalanceFailureResolved',
+    'apiKeyBalanceLeaseRenewed',
+    'apiKeyBalanceLeaseReleased',
     'configChanged',
     'tokenUsageUpdated',
     'remoteMetadataUpdated',
@@ -548,6 +653,8 @@ const INTER_INSTANCE_EVENT_TYPE_SET = new Set<string>(INTER_INSTANCE_EVENT_TYPES
 
 const AUTHORITY_EVENT_TYPES = new Set<InterInstanceEventType>([
     'apiKeyFailoverResolved',
+    'apiKeyBalanceAssignmentResolved',
+    'apiKeyBalanceFailureResolved',
     'remoteMetadataUpdated',
     'leaderChanged',
     'leaderResigning',
