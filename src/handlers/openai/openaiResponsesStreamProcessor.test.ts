@@ -1,6 +1,8 @@
 ﻿import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
 import test from 'node:test';
+import { APIError } from 'openai';
+import type { StreamReporter } from '../streamReporter';
 
 const require = createRequire(import.meta.url);
 const NodeModule = require('node:module') as {
@@ -37,10 +39,13 @@ async function getProcessorModule() {
 
 function createProcessor(
     OpenAIResponsesStreamProcessor: typeof import('./openaiResponsesStreamProcessor').OpenAIResponsesStreamProcessor,
-    reporterOverrides: Record<string, unknown> = {},
+    reporterOverrides: Partial<
+        Pick<StreamReporter, 'reportToolCall' | 'reportToolResult' | 'reportToolArgDelta' | 'flushAll'>
+    > = {},
     options: { token?: unknown; abortController?: AbortController } = {}
 ) {
     const reported: string[] = [];
+    let hasToolOutput = false;
     const flushed: Array<{ finishReason?: unknown; responseId?: string; usage?: unknown }> = [];
     const streamReporter = {
         heartbeat() {},
@@ -48,15 +53,27 @@ function createProcessor(
         reportText(text: string) {
             reported.push(text);
         },
-        flushAll(_finishReason: unknown, customStatefulData?: { responseId?: string }, finalUsage?: unknown) {
+        ...reporterOverrides,
+        flushAll(...args: Parameters<StreamReporter['flushAll']>) {
+            const [_finishReason, customStatefulData, finalUsage] = args;
             flushed.push({
                 finishReason: _finishReason,
                 responseId: customStatefulData?.responseId,
                 usage: finalUsage
             });
-            return true;
+            return reporterOverrides.flushAll?.(...args) ?? true;
         },
-        ...reporterOverrides
+        get hasContent() {
+            return reported.length > 0 || hasToolOutput;
+        },
+        reportToolCall(...args: Parameters<StreamReporter['reportToolCall']>) {
+            reporterOverrides.reportToolCall?.(...args);
+            hasToolOutput = true;
+        },
+        reportToolResult(...args: Parameters<StreamReporter['reportToolResult']>) {
+            reporterOverrides.reportToolResult?.(...args);
+            hasToolOutput = true;
+        }
     };
     const processor = new OpenAIResponsesStreamProcessor({
         modelName: 'test-model',
@@ -74,6 +91,39 @@ async function* eventsFrom(events: unknown[]) {
     for (const event of events) {
         yield event;
     }
+}
+
+for (const ending of ['empty', 'created', 'invalid-tool', 'completed-empty', 'length-empty', 'cancelled']) {
+    test(`consume：空结果与终态判定 ${ending}`, async () => {
+        const { OpenAIResponsesStreamProcessor } = await getProcessorModule();
+        const { processor, reported, flushed } = createProcessor(
+            OpenAIResponsesStreamProcessor,
+            {},
+            { token: { isCancellationRequested: ending === 'cancelled' } }
+        );
+        const events =
+            ending === 'created' ? [{ type: 'response.created', response: { id: 'empty', status: 'in_progress' } }]
+            : ending === 'invalid-tool' ?
+                [{ type: 'response.function_call_arguments.done', call_id: 'c', name: 'read_file', arguments: '{' }]
+            : ending === 'completed-empty' ? [{ type: 'response.completed', response: { id: 'empty', output: [] } }]
+            : ending === 'length-empty' ?
+                [{ type: 'response.incomplete', response: { incomplete_details: { reason: 'max_output_tokens' } } }]
+            :   [];
+        if (ending === 'completed-empty' || ending === 'length-empty') {
+            await processor.consume(eventsFrom(events) as never);
+            assert.equal(processor.isResponseFinalized(), true);
+            assert.equal(flushed.length, 1);
+        } else {
+            await assert.rejects(processor.consume(eventsFrom(events) as never), (error: unknown) => {
+                assert.ok(error instanceof Error);
+                assert.equal(error.constructor.name === 'APIUserAbortError', ending === 'cancelled');
+                return true;
+            });
+            assert.equal(processor.isResponseFinalized(), false);
+            assert.deepEqual(flushed, []);
+        }
+        assert.deepEqual(reported, []);
+    });
 }
 
 for (const completed of [false, true]) {
@@ -301,37 +351,72 @@ test('consume：缺少 item id 的不同 output index 与 completed-only 调用�
     }
 });
 
-test('consume：只有 arguments.done 时流末回退，取消和失败不执行缓存', async () => {
-    const { OpenAIResponsesStreamProcessor } = await getProcessorModule();
-    for (const ending of ['eof', 'failed', 'cancelled']) {
-        const calls: unknown[] = [];
+for (const ending of [
+    'eof',
+    'failed',
+    'cancelled',
+    'eof-cancel-tool',
+    'eof-cancel-marker',
+    'completed',
+    'completed-cancel-tool',
+    'completed-cancel-marker'
+]) {
+    test(`consume：arguments.done 收尾与取消 ${ending}`, async () => {
+        const { OpenAIResponsesStreamProcessor } = await getProcessorModule();
+        const calls: string[] = [];
         const token = { isCancellationRequested: false };
-        const { processor } = createProcessor(
+        const { processor, flushed } = createProcessor(
             OpenAIResponsesStreamProcessor,
             {
-                reportToolCall(...args: unknown[]) {
-                    calls.push(args);
+                reportToolCall(id) {
+                    calls.push(id);
+                    if (ending.endsWith('cancel-tool')) {
+                        token.isCancellationRequested = true;
+                    }
+                },
+                flushAll() {
+                    if (ending.endsWith('cancel-marker')) {
+                        token.isCancellationRequested = true;
+                    }
+                    return true;
                 }
             },
             { token }
         );
         async function* stream() {
-            yield { type: 'response.function_call_arguments.done', call_id: 'c', name: 'read_file', arguments: '{}' };
+            for (const call_id of ['c1', 'c2']) {
+                yield { type: 'response.function_call_arguments.done', call_id, name: 'read_file', arguments: '{}' };
+            }
             if (ending === 'failed') {
                 yield { type: 'response.failed', response: { error: { message: 'failed' } } };
             }
             if (ending === 'cancelled') {
                 token.isCancellationRequested = true;
             }
+            if (ending.startsWith('completed')) {
+                yield { type: 'response.completed', response: { id: 'r', output: [] } };
+            }
         }
-        if (ending === 'eof') {
+        if (ending === 'eof' || ending === 'completed') {
             await processor.consume(stream() as never);
         } else {
-            await assert.rejects(processor.consume(stream() as never));
+            await assert.rejects(processor.consume(stream() as never), (error: unknown) => {
+                assert.ok(error instanceof Error);
+                assert.equal(error.constructor.name === 'APIUserAbortError', ending !== 'failed');
+                return true;
+            });
         }
-        assert.equal(calls.length, ending === 'eof' ? 1 : 0);
-    }
-});
+        const noOutput = ending === 'failed' || ending === 'cancelled';
+        assert.deepEqual(
+            calls,
+            noOutput ? []
+            : ending.endsWith('cancel-tool') ? ['c1']
+            : ['c1', 'c2']
+        );
+        assert.equal(flushed.length, noOutput ? 0 : 1);
+        assert.equal(token.isCancellationRequested, ending.includes('cancel'));
+    });
+}
 
 test('consume：无终态事件时统一收口并刷新 marker', async () => {
     const { OpenAIResponsesStreamProcessor } = await getProcessorModule();
@@ -614,6 +699,34 @@ test('consume：response.failed 带 usage 时保留终态 usage', async () => {
     assert.deepEqual(processor.getFinalUsage(), usage);
     assert.ok(typeof processor.getStreamEndTime() === 'number');
 });
+
+for (const type of ['response.failed', 'response.incomplete', 'error']) {
+    test(`consume：${type} 保留结构化错误，不伪造 HTTP 状态`, async () => {
+        const { OpenAIResponsesStreamProcessor } = await getProcessorModule();
+        const { processor } = createProcessor(OpenAIResponsesStreamProcessor);
+        const detail = { message: 'Service Unavailable', code: 'usage_limit_reached', current_balance: 0 };
+        const event =
+            type === 'error' ?
+                { type, ...detail, param: null, sequence_number: 0 }
+            :   {
+                    type,
+                    response: {
+                        id: 'failed',
+                        error: detail,
+                        output: [],
+                        incomplete_details: { reason: 'content_filter' }
+                    }
+                };
+        await assert.rejects(processor.consume(eventsFrom([event]) as never), (error: unknown) => {
+            assert.ok(error instanceof APIError);
+            assert.equal(error.status, undefined);
+            assert.equal(error.code, detail.code);
+            assert.equal(error.message, detail.message);
+            assert.deepEqual(error.error, type === 'error' ? event : detail);
+            return true;
+        });
+    });
+}
 
 test('consume：正常事件流完整分发并结束', async () => {
     const { OpenAIResponsesStreamProcessor } = await getProcessorModule();

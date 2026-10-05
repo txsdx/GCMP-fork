@@ -19,6 +19,7 @@ import { sanitizeAuthoritativeDims } from '../rateLimit/rateLimitStore';
 import { ApiKeyManager } from '../utils/config/apiKeyManager';
 import { captureRequestApiKeyNames, getSiteOwnerProvider, readCurrentSite } from '../utils/config/configSetCommands';
 import { ConfigManager } from '../utils/config/configManager';
+import { ConfigSetStore } from '../utils/config/configSetStore';
 import { isDashscopeProviderSlot, resolveDashscopeBaseUrl } from '../utils/net/dashscopeEndpoint';
 import { createLanguageModelChatInformation } from '../utils/model/languageModelInfo';
 import { isCancellationError } from '../utils/text/cancellationError';
@@ -40,7 +41,13 @@ import { getAnthropicRetryDelayMs, shouldRetryAnthropicRequest } from '../handle
 import { ContextUsageStatusBar } from '../status/contextUsageStatusBar';
 import { TokenUsagesManager } from '../usages/usagesManager';
 import { OpenAIResponsesHandler } from '../handlers/openai/openaiResponsesHandler';
-import { getAllStatefulMarkersAndIndicies } from '../handlers/statefulMarker';
+import {
+    decodeStatefulMarker,
+    encodeStatefulMarker,
+    getAllStatefulMarkersAndIndicies,
+    type StatefulMarkerContainer
+} from '../handlers/statefulMarker';
+import { CustomDataPartMimeTypes } from '../handlers/types';
 import { classifyRequest } from '../handlers/requestClassifier';
 import { SessionTitleService } from '../usages/sessionTitleService';
 import { SessionRecoveryService } from '../usages/sessionRecoveryService';
@@ -56,6 +63,7 @@ import {
     type ApiKeyFailoverAttempt
 } from '../utils/config/failover/apiKeyFailoverManager';
 import { isApiKeyFailoverError } from '../utils/config/failover/apiKeyFailoverClassifier';
+import { BalanceAffinityCache, getBalanceTurnKey } from '../utils/config/failover/balanceAffinityCache';
 
 interface ContextUsageSummary {
     totalInputTokens: number;
@@ -88,10 +96,15 @@ function isSubagentRequestKind(requestKind?: string): boolean {
 function getMainAgentBalanceKey(
     sessionId: string,
     messages: readonly LanguageModelChatMessage[],
-    requestKind: string
+    requestKind: string,
+    telemetryTurn?: number
 ): string {
     if (requestKind !== 'main-agent') {
         return `s:${sessionId}`;
+    }
+    const turnKey = getBalanceTurnKey(sessionId, telemetryTurn);
+    if (turnKey) {
+        return turnKey;
     }
     const userText = SessionTitleService.extractLatestUserRequestText(messages);
     if (!userText) {
@@ -422,7 +435,15 @@ export class GenericModelProvider implements LanguageModelChatProvider {
             requestKind,
             sessionId,
             subSessionId,
-            balanceKey: subSessionId ? `a:${subSessionId}` : getMainAgentBalanceKey(sessionId, messages, requestKind),
+            balanceKey:
+                subSessionId ?
+                    `a:${subSessionId}`
+                :   getMainAgentBalanceKey(
+                        sessionId,
+                        messages,
+                        requestKind,
+                        (options as RuntimeProvideLanguageModelChatResponseOptions).modelOptions?._telemetryTurn
+                    ),
             sessionRecoverySource,
             sdkMode,
             totalInputTokens,
@@ -783,6 +804,59 @@ export class GenericModelProvider implements LanguageModelChatProvider {
 
         const requestKind = this.ensureRequestKind(messages, options);
 
+        const canRecoverAffinity =
+            requestKind === 'main-agent' &&
+            balanceKey ===
+                getBalanceTurnKey(
+                    sessionId,
+                    (options as RuntimeProvideLanguageModelChatResponseOptions).modelOptions?._telemetryTurn
+                );
+        let turnStartIndex = -1;
+        if (requestKind === 'main-agent') {
+            for (let index = messages.length - 1; index >= 0; index--) {
+                if (SessionTitleService.extractLatestUserRequestText([messages[index]])) {
+                    turnStartIndex = index;
+                    break;
+                }
+            }
+        }
+        let preferredBalanceCredentialId: string | undefined;
+        let balanceAffinity: StatefulMarkerContainer['balanceAffinity'];
+        let hasCurrentMarker = false;
+        const subSessionId = (options as RuntimeProvideLanguageModelChatResponseOptions).modelOptions?.subSessionId;
+        for (const { statefulMarker, index } of getAllStatefulMarkersAndIndicies(messages)) {
+            if (index < turnStartIndex) {
+                break;
+            }
+            hasCurrentMarker = true;
+            const marker = statefulMarker.marker;
+            if (
+                marker?.extension !== 'vicanent.gcmp' ||
+                marker.sessionId !== sessionId ||
+                marker.subSessionId !== subSessionId
+            ) {
+                continue;
+            }
+            const affinity = marker.balanceAffinity;
+            if (
+                affinity?.slot === effectiveProviderKey &&
+                affinity.balanceKey === balanceKey &&
+                typeof affinity.credentialId === 'string' &&
+                /^[a-f0-9]{64}$/.test(affinity.credentialId)
+            ) {
+                preferredBalanceCredentialId = affinity.credentialId;
+            }
+            break;
+        }
+        // Copilot 会在压缩边界剥离 marker，只有明确的 turn 身份才允许缓存恢复。
+        if (
+            canRecoverAffinity &&
+            !hasCurrentMarker &&
+            ConfigSetStore.getSwitchMode(effectiveProviderKey) === 'balance'
+        ) {
+            preferredBalanceCredentialId = BalanceAffinityCache.instance.get(effectiveProviderKey, balanceKey);
+        }
+
         // 处理消息中的图片 DataPart（仅对 imageInput: false 的模型生效）
         if (this.visionCache && !modelConfig.capabilities?.imageInput) {
             try {
@@ -813,6 +887,9 @@ export class GenericModelProvider implements LanguageModelChatProvider {
             // 包装 progress：首次 report 时清除重试消息
             const wrappedProgress: Progress<vscode.LanguageModelResponsePart> = {
                 report: (value: vscode.LanguageModelResponsePart) => {
+                    if (token.isCancellationRequested && value instanceof vscode.LanguageModelToolCallPart) {
+                        return;
+                    }
                     retryMessageDisposable?.dispose();
                     retryMessageDisposable = undefined;
                     hasReportedProgress = true;
@@ -821,6 +898,19 @@ export class GenericModelProvider implements LanguageModelChatProvider {
                     }
                     if (isSummarizationRequest && value instanceof vscode.LanguageModelTextPart) {
                         summaryResponseBuffer += value.value;
+                    }
+                    if (
+                        balanceAffinity &&
+                        value instanceof vscode.LanguageModelDataPart &&
+                        value.mimeType === CustomDataPartMimeTypes.StatefulMarker
+                    ) {
+                        const decoded = decodeStatefulMarker(value.data);
+                        if (decoded?.marker?.extension === 'vicanent.gcmp' && decoded.marker.sessionId === sessionId) {
+                            value = new vscode.LanguageModelDataPart(
+                                encodeStatefulMarker(decoded.modelId, { ...decoded.marker, balanceAffinity }),
+                                CustomDataPartMimeTypes.StatefulMarker
+                            );
+                        }
                     }
                     progress.report(value);
                 }
@@ -853,15 +943,19 @@ export class GenericModelProvider implements LanguageModelChatProvider {
                         failoverAttempt = await ApiKeyFailoverManager.captureAttempt(
                             effectiveProviderKey,
                             balanceKey,
-                            balanceAllocationRequestId
+                            balanceAllocationRequestId,
+                            preferredBalanceCredentialId,
+                            token
                         );
                         const nextBalanceLeaseId = failoverAttempt?.balanceLeaseId;
                         if (balanceLeaseId && balanceLeaseId !== nextBalanceLeaseId) {
                             ApiKeyFailoverManager.releaseBalanceLease(balanceLeaseId);
-                            balanceLeaseId = undefined;
+                        }
+                        balanceLeaseId = nextBalanceLeaseId;
+                        if (token.isCancellationRequested) {
+                            throw new vscode.CancellationError();
                         }
                         if (nextBalanceLeaseId && failoverAttempt) {
-                            balanceLeaseId = nextBalanceLeaseId;
                             ApiKeyFailoverManager.startBalanceLeaseHeartbeat(failoverAttempt, effectiveProviderKey);
                         }
                         if (
@@ -894,6 +988,34 @@ export class GenericModelProvider implements LanguageModelChatProvider {
                         if (failoverAttempt) {
                             ApiKeyManager.bindRequestApiKey(attemptModelConfig, failoverAttempt.apiKey);
                         }
+                        balanceAffinity = undefined;
+                        if (failoverAttempt?.mode === 'balance') {
+                            balanceAffinity = {
+                                slot: effectiveProviderKey,
+                                balanceKey,
+                                credentialId: failoverAttempt.identity
+                            };
+                        } else if (
+                            !failoverAttempt &&
+                            ConfigSetStore.getSwitchMode(effectiveProviderKey) === 'balance'
+                        ) {
+                            const apiKey = await ApiKeyManager.getApiKey(effectiveProviderKey);
+                            if (token.isCancellationRequested) {
+                                throw new vscode.CancellationError();
+                            }
+                            if (apiKey && ConfigSetStore.getSwitchMode(effectiveProviderKey) === 'balance') {
+                                ApiKeyManager.bindRequestApiKey(attemptModelConfig, apiKey);
+                                balanceAffinity = {
+                                    slot: effectiveProviderKey,
+                                    balanceKey,
+                                    credentialId: crypto
+                                        .createHash('sha256')
+                                        .update(`${apiKey}\u0000${requestSite ?? ''}`)
+                                        .digest('hex')
+                                };
+                            }
+                        }
+                        preferredBalanceCredentialId = balanceAffinity?.credentialId;
                         const requestApiKeyNames =
                             requestId && !failoverAttempt ?
                                 await captureRequestApiKeyNames(effectiveProviderKey, requestSite)
@@ -910,6 +1032,17 @@ export class GenericModelProvider implements LanguageModelChatProvider {
                         };
                         if (token.isCancellationRequested) {
                             throw new vscode.CancellationError();
+                        }
+                        if (
+                            canRecoverAffinity &&
+                            balanceAffinity &&
+                            ConfigSetStore.getSwitchMode(effectiveProviderKey) === 'balance'
+                        ) {
+                            BalanceAffinityCache.instance.remember(
+                                effectiveProviderKey,
+                                balanceKey,
+                                balanceAffinity.credentialId
+                            );
                         }
                         attemptDispatched = true;
                         if (sdkMode === 'gemini-sse') {
@@ -983,6 +1116,9 @@ export class GenericModelProvider implements LanguageModelChatProvider {
                                 wasThrottled
                             );
                         }
+                        if (token.isCancellationRequested) {
+                            throw new vscode.CancellationError();
+                        }
                         // 成功：释放并发槽位但不退款（v1 不做结算）
                         if (limitHandle) {
                             RateLimiter.release(limitHandle);
@@ -1005,7 +1141,10 @@ export class GenericModelProvider implements LanguageModelChatProvider {
                                 attemptDispatched ? { tokens: limitHandle.costs.tokens } : limitHandle.costs
                             );
                         }
-                        if (!attemptDispatched || token.isCancellationRequested || !isApiKeyFailoverError(error)) {
+                        if (token.isCancellationRequested) {
+                            throw new vscode.CancellationError();
+                        }
+                        if (!attemptDispatched || !isApiKeyFailoverError(error)) {
                             throw error;
                         }
                         const hasRetryBudget = retryConfig.maxAttempts === -1 || retryAttempt < retryConfig.maxAttempts;
@@ -1132,6 +1271,11 @@ export class GenericModelProvider implements LanguageModelChatProvider {
                     Logger.debug('Failed to resolve generated session title:', err);
                 }
             }
+        } catch (error) {
+            if (token.isCancellationRequested) {
+                throw new vscode.CancellationError();
+            }
+            throw error;
         } finally {
             if (balanceLeaseId) {
                 ApiKeyFailoverManager.releaseBalanceLease(balanceLeaseId);

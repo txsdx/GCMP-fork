@@ -127,7 +127,9 @@ function isApiKeyBalanceAssignmentRequestedPayload(
         value.slot.length <= 128 &&
         typeof value.balanceKey === 'string' &&
         value.balanceKey.length > 0 &&
-        value.balanceKey.length <= 512
+        value.balanceKey.length <= 512 &&
+        (value.preferredCredentialId === undefined ||
+            (typeof value.preferredCredentialId === 'string' && /^[a-f0-9]{64}$/.test(value.preferredCredentialId)))
     );
 }
 
@@ -302,9 +304,17 @@ export function registerInterInstanceHandlers(context: vscode.ExtensionContext):
             (payload.mode === undefined || payload.enabled === (payload.mode !== 'off'))
         );
     };
-    LeaderElectionService.setBalanceLeaseSnapshotProvider(() => ApiKeyFailoverManager.prepareBalanceLeaseHandoff());
+    LeaderElectionService.setBalanceLeaseSnapshotProvider(
+        strict => ApiKeyFailoverManager.prepareBalanceLeaseHandoff(strict),
+        snapshot => ApiKeyFailoverManager.isBalanceLeaseHandoffCurrent(snapshot)
+    );
 
     context.subscriptions.push(
+        LeaderElectionService.onHandoffStateChanged(paused => {
+            if (!paused) {
+                ApiKeyFailoverManager.cancelBalanceLeaseHandoff();
+            }
+        }),
         InterInstanceBus.onAuthorityChanged(authorityTerm => {
             if (LeaderElectionService.isLeader()) {
                 void ApiKeyFailoverManager.becomeBalanceAuthority(authorityTerm);
@@ -361,6 +371,7 @@ export function registerInterInstanceHandlers(context: vscode.ExtensionContext):
                 payload.leaderId.length === 0 ||
                 payload.leaderId.length > 128 ||
                 payload.leaderId !== event.senderInstanceId ||
+                (payload.reason !== undefined && payload.reason !== 'manual' && payload.reason !== 'shutdown') ||
                 (payload.nextLeaderId !== undefined &&
                     (typeof payload.nextLeaderId !== 'string' ||
                         payload.nextLeaderId.length === 0 ||
@@ -371,7 +382,9 @@ export function registerInterInstanceHandlers(context: vscode.ExtensionContext):
             ) {
                 return;
             }
-            clearRemoteLiveMetrics(event.senderInstanceId);
+            if (payload.reason !== 'manual') {
+                clearRemoteLiveMetrics(event.senderInstanceId);
+            }
             const knownAuthorityTerm = InterInstanceBus.getAuthorityTerm();
             if (
                 payload.balanceLeaseSnapshot &&
