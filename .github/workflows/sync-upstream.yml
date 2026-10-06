@@ -1,208 +1,350 @@
 name: Sync upstream GCMP
 
 on:
-  schedule:
-    # GitHub Actions 不能直接监听另一个仓库的 release，故采用定时轮询。
-    # 如需更快同步，可手动触发 workflow_dispatch。
-    - cron: '17 * * * *'
-  workflow_dispatch:
+    schedule:
+        # GitHub Actions 不能直接监听另一个仓库的 release，故采用定时轮询。
+        # 如需更快同步，可手动触发 workflow_dispatch。
+        - cron: "17 * * * *"
+    workflow_dispatch:
 
 permissions:
-  contents: write
+    contents: write
 
 concurrency:
-  group: sync-upstream-main
-  cancel-in-progress: false
+    group: sync-upstream-main
+    cancel-in-progress: false
 
 jobs:
-  sync:
-    runs-on: ubuntu-latest
+    sync:
+        runs-on: ubuntu-latest
 
-    steps:
-      - name: Checkout fork main
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          git init .
-          git remote add origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
-          git fetch --no-tags origin main
-          git checkout -B main FETCH_HEAD
+        steps:
+            - name: Checkout fork main
+              env:
+                  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+              run: |
+                  set -euo pipefail
+                  git init .
+                  git remote add origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+                  git fetch --no-tags origin main
+                  git checkout -B main FETCH_HEAD
 
-      - name: Configure git identity
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            - name: Configure git identity
+              run: |
+                  git config user.name "github-actions[bot]"
+                  git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-      - name: Merge upstream main into fork main
-        run: |
-          set -euo pipefail
+            - name: Merge upstream main into fork main
+              run: |
+                  set -euo pipefail
 
-          if git remote get-url upstream >/dev/null 2>&1; then
-            git remote set-url upstream "https://github.com/VicBilibily/GCMP.git"
-          else
-            git remote add upstream "https://github.com/VicBilibily/GCMP.git"
-          fi
+                  if git remote get-url upstream >/dev/null 2>&1; then
+                    git remote set-url upstream "https://github.com/VicBilibily/GCMP.git"
+                  else
+                    git remote add upstream "https://github.com/VicBilibily/GCMP.git"
+                  fi
 
-          git fetch --no-tags upstream main
-          git checkout main
-          git merge --no-ff --no-edit upstream/main
-          git push origin main
+                  git fetch --no-tags upstream main
+                  git checkout main
 
-      - name: Sync latest upstream release
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
-        run: |
-          node <<'NODE'
-          const upstreamOwner = 'VicBilibily';
-          const upstreamRepo = 'GCMP';
-          const [forkOwner, forkRepo] = process.env.GITHUB_REPOSITORY.split('/');
-          const token = process.env.GITHUB_TOKEN;
+                  # 保存合并前 fork main 的 commit。
+                  # .github/workflows/ 始终以这个版本为准，
+                  # 不接受上游对 workflow 的新增、修改或删除。
+                  FORK_HEAD="$(git rev-parse HEAD)"
 
-          if (!token) {
-            throw new Error('GITHUB_TOKEN is required');
-          }
+                  # 使用 --no-commit，以便在生成 merge commit 前
+                  # 把 .github/workflows/ 恢复成 fork 自己的版本。
+                  #
+                  # 暂时关闭 set -e，因为有 merge conflict 时
+                  # git merge 会返回非 0；workflow 冲突我们可以自动处理。
+                  set +e
+                  git merge --no-ff --no-commit upstream/main
+                  MERGE_STATUS=$?
+                  set -e
 
-          const apiBase = 'https://api.github.com';
-          const defaultHeaders = {
-            Authorization: 'Bearer ' + token,
-            Accept: 'application/vnd.github+json',
-            'X-GitHub-Api-Version': '2022-11-28',
-          };
+                  # 无论上游如何修改 .github/workflows/，
+                  # 都完整恢复为合并前 fork 自己的版本。
+                  #
+                  # 包括：
+                  # - 上游修改已有 workflow
+                  # - 上游新增 workflow
+                  # - 上游删除 workflow
+                  # - workflow 文件发生 merge conflict
+                  git restore \
+                    --source="$FORK_HEAD" \
+                    --staged \
+                    --worktree \
+                    -- .github/workflows
 
-          async function api(path, options = {}) {
-            const response = await fetch(`${apiBase}${path}`, {
-              ...options,
-              headers: {
-                ...defaultHeaders,
-                ...(options.headers || {}),
-              },
-            });
+                  # workflow 冲突已经按 fork 版本解决。
+                  # 如果还有其他文件存在冲突，则不能静默忽略，
+                  # 直接让 Action 失败并打印冲突文件。
+                  REMAINING_CONFLICTS="$(git diff --name-only --diff-filter=U)"
 
-            if (response.status === 204) {
-              return null;
-            }
+                  if [ -n "$REMAINING_CONFLICTS" ]; then
+                    echo "::error::Merge conflicts remain outside .github/workflows:"
+                    echo "$REMAINING_CONFLICTS"
+                    exit 1
+                  fi
 
-            if (!response.ok) {
-              const text = await response.text();
-              const error = new Error(`GitHub API ${response.status}: ${text}`);
-              error.status = response.status;
-              throw error;
-            }
-            return response.json();
-          }
+                  # 如果存在 MERGE_HEAD，说明确实进入了 merge 状态，
+                  # 此时提交合并结果。
+                  if git rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1; then
+                    git commit --no-edit
 
-          async function paginate(pathFactory) {
-            const all = [];
-            for (let page = 1; ; page += 1) {
-              const pageData = await api(pathFactory(page));
-              all.push(...pageData);
-              if (pageData.length < 100) {
-                break;
-              }
-            }
-            return all;
-          }
+                  # 如果 merge 返回非 0，但又没有 MERGE_HEAD，
+                  # 说明发生了无法按上述逻辑处理的异常。
+                  elif [ "$MERGE_STATUS" -ne 0 ]; then
+                    echo "::error::Merge failed and no merge state remains."
+                    exit "$MERGE_STATUS"
 
-          async function getLatestPublishedRelease(owner, repo) {
-            const releases = await paginate((page) => `/repos/${owner}/${repo}/releases?per_page=100&page=${page}`);
-            return releases.find((release) => !release.draft) || null;
-          }
+                  else
+                    echo "Fork main is already up to date with upstream main."
+                  fi
 
-          async function listAllAssets(owner, repo, releaseId) {
-            return paginate((page) => `/repos/${owner}/${repo}/releases/${releaseId}/assets?per_page=100&page=${page}`);
-          }
+                  git push origin main
 
-          async function ensureForkRelease(upstreamRelease) {
-            try {
-              const existing = await api(`/repos/${forkOwner}/${forkRepo}/releases/tags/${encodeURIComponent(upstreamRelease.tag_name)}`);
-              console.log(`Release ${upstreamRelease.tag_name} already exists in fork.`);
-              return { release: existing, created: false };
-            } catch (error) {
-              if (error.status !== 404) {
-                throw error;
-              }
-            }
+            - name: Sync latest upstream release
+              env:
+                  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+                  GITHUB_REPOSITORY: ${{ github.repository }}
+              run: |
+                  node <<'NODE'
+                  const upstreamOwner = 'VicBilibily';
+                  const upstreamRepo = 'GCMP';
+                  const [forkOwner, forkRepo] = process.env.GITHUB_REPOSITORY.split('/');
+                  const token = process.env.GITHUB_TOKEN;
 
-            const created = await api(`/repos/${forkOwner}/${forkRepo}/releases`, {
-              method: 'POST',
-              headers: {
-                'Content-Type': 'application/json',
-              },
-              body: JSON.stringify({
-                tag_name: upstreamRelease.tag_name,
-                target_commitish: 'main',
-                name: upstreamRelease.name || upstreamRelease.tag_name,
-                body: upstreamRelease.body ?? '',
-                draft: Boolean(upstreamRelease.draft),
-                prerelease: Boolean(upstreamRelease.prerelease),
-              }),
-            });
-            console.log(`Created fork release ${upstreamRelease.tag_name}.`);
-            return { release: created, created: true };
-          }
+                  if (!token) {
+                    throw new Error('GITHUB_TOKEN is required');
+                  }
 
-          async function uploadMissingAssets(upstreamRelease, forkRelease) {
-            const upstreamAssets = await listAllAssets(upstreamOwner, upstreamRepo, upstreamRelease.id);
-            if (upstreamAssets.length === 0) {
-              console.log('Upstream release has no assets.');
-              return;
-            }
-
-            const forkAssets = await listAllAssets(forkOwner, forkRepo, forkRelease.id);
-            const existingNames = new Set(forkAssets.map((asset) => asset.name));
-            const uploadBase = forkRelease.upload_url.replace(/\{[^}]+}$/, '');
-
-            for (const asset of upstreamAssets) {
-              if (existingNames.has(asset.name)) {
-                console.log(`Asset ${asset.name} already exists in fork release, skipping.`);
-                continue;
-              }
-
-              try {
-                const download = await fetch(asset.browser_download_url);
-                if (!download.ok) {
-                  throw new Error(`download failed with status ${download.status}`);
-                }
-
-                const assetData = Buffer.from(await download.arrayBuffer());
-                const uploadUrl = `${uploadBase}?name=${encodeURIComponent(asset.name)}`;
-                const uploadResponse = await fetch(uploadUrl, {
-                  method: 'POST',
-                  headers: {
+                  const apiBase = 'https://api.github.com';
+                  const defaultHeaders = {
                     Authorization: 'Bearer ' + token,
                     Accept: 'application/vnd.github+json',
                     'X-GitHub-Api-Version': '2022-11-28',
-                    'Content-Type': asset.content_type || 'application/octet-stream',
-                    'Content-Length': String(assetData.length),
-                  },
-                  body: assetData,
-                });
+                  };
 
-                if (!uploadResponse.ok) {
-                  const text = await uploadResponse.text();
-                  throw new Error(`upload failed with status ${uploadResponse.status}: ${text}`);
-                }
+                  async function api(path, options = {}) {
+                    const response = await fetch(`${apiBase}${path}`, {
+                      ...options,
+                      headers: {
+                        ...defaultHeaders,
+                        ...(options.headers || {}),
+                      },
+                    });
 
-                console.log(`Uploaded asset ${asset.name}.`);
-              } catch (error) {
-                console.warn(`Failed to sync asset ${asset.name}: ${error.message}`);
-              }
-            }
-          }
+                    if (response.status === 204) {
+                      return null;
+                    }
 
-          const latestUpstream = await getLatestPublishedRelease(upstreamOwner, upstreamRepo);
-          if (!latestUpstream) {
-            console.log('No published upstream release found; skipping release sync.');
-            process.exit(0);
-          }
+                    if (!response.ok) {
+                      const text = await response.text();
+                      const error = new Error(`GitHub API ${response.status}: ${text}`);
+                      error.status = response.status;
+                      throw error;
+                    }
 
-          console.log(`Latest upstream release: ${latestUpstream.tag_name}`);
-          const { release: forkRelease, created } = await ensureForkRelease(latestUpstream);
-          await uploadMissingAssets(latestUpstream, forkRelease);
+                    return response.json();
+                  }
 
-          if (!created) {
-            console.log('Release already existed; assets were checked for idempotent sync.');
-          }
-          NODE
+                  async function paginate(pathFactory) {
+                    const all = [];
+
+                    for (let page = 1; ; page += 1) {
+                      const pageData = await api(pathFactory(page));
+                      all.push(...pageData);
+
+                      if (pageData.length < 100) {
+                        break;
+                      }
+                    }
+
+                    return all;
+                  }
+
+                  async function getLatestPublishedRelease(owner, repo) {
+                    const releases = await paginate(
+                      (page) =>
+                        `/repos/${owner}/${repo}/releases?per_page=100&page=${page}`
+                    );
+
+                    return releases.find((release) => !release.draft) || null;
+                  }
+
+                  async function listAllAssets(owner, repo, releaseId) {
+                    return paginate(
+                      (page) =>
+                        `/repos/${owner}/${repo}/releases/${releaseId}/assets?per_page=100&page=${page}`
+                    );
+                  }
+
+                  async function ensureForkRelease(upstreamRelease) {
+                    try {
+                      const existing = await api(
+                        `/repos/${forkOwner}/${forkRepo}/releases/tags/${encodeURIComponent(
+                          upstreamRelease.tag_name
+                        )}`
+                      );
+
+                      console.log(
+                        `Release ${upstreamRelease.tag_name} already exists in fork.`
+                      );
+
+                      return {
+                        release: existing,
+                        created: false,
+                      };
+                    } catch (error) {
+                      if (error.status !== 404) {
+                        throw error;
+                      }
+                    }
+
+                    const created = await api(
+                      `/repos/${forkOwner}/${forkRepo}/releases`,
+                      {
+                        method: 'POST',
+                        headers: {
+                          'Content-Type': 'application/json',
+                        },
+                        body: JSON.stringify({
+                          tag_name: upstreamRelease.tag_name,
+                          target_commitish: 'main',
+                          name: upstreamRelease.name || upstreamRelease.tag_name,
+                          body: upstreamRelease.body ?? '',
+                          draft: Boolean(upstreamRelease.draft),
+                          prerelease: Boolean(upstreamRelease.prerelease),
+                        }),
+                      }
+                    );
+
+                    console.log(
+                      `Created fork release ${upstreamRelease.tag_name}.`
+                    );
+
+                    return {
+                      release: created,
+                      created: true,
+                    };
+                  }
+
+                  async function uploadMissingAssets(
+                    upstreamRelease,
+                    forkRelease
+                  ) {
+                    const upstreamAssets = await listAllAssets(
+                      upstreamOwner,
+                      upstreamRepo,
+                      upstreamRelease.id
+                    );
+
+                    if (upstreamAssets.length === 0) {
+                      console.log('Upstream release has no assets.');
+                      return;
+                    }
+
+                    const forkAssets = await listAllAssets(
+                      forkOwner,
+                      forkRepo,
+                      forkRelease.id
+                    );
+
+                    const existingNames = new Set(
+                      forkAssets.map((asset) => asset.name)
+                    );
+
+                    const uploadBase = forkRelease.upload_url.replace(
+                      /\{[^}]+}$/,
+                      ''
+                    );
+
+                    for (const asset of upstreamAssets) {
+                      if (existingNames.has(asset.name)) {
+                        console.log(
+                          `Asset ${asset.name} already exists in fork release, skipping.`
+                        );
+                        continue;
+                      }
+
+                      try {
+                        const download = await fetch(asset.browser_download_url);
+
+                        if (!download.ok) {
+                          throw new Error(
+                            `download failed with status ${download.status}`
+                          );
+                        }
+
+                        const assetData = Buffer.from(
+                          await download.arrayBuffer()
+                        );
+
+                        const uploadUrl =
+                          `${uploadBase}?name=${encodeURIComponent(asset.name)}`;
+
+                        const uploadResponse = await fetch(uploadUrl, {
+                          method: 'POST',
+                          headers: {
+                            Authorization: 'Bearer ' + token,
+                            Accept: 'application/vnd.github+json',
+                            'X-GitHub-Api-Version': '2022-11-28',
+                            'Content-Type':
+                              asset.content_type ||
+                              'application/octet-stream',
+                            'Content-Length': String(assetData.length),
+                          },
+                          body: assetData,
+                        });
+
+                        if (!uploadResponse.ok) {
+                          const text = await uploadResponse.text();
+
+                          throw new Error(
+                            `upload failed with status ${uploadResponse.status}: ${text}`
+                          );
+                        }
+
+                        console.log(`Uploaded asset ${asset.name}.`);
+                      } catch (error) {
+                        console.warn(
+                          `Failed to sync asset ${asset.name}: ${error.message}`
+                        );
+                      }
+                    }
+                  }
+
+                  const latestUpstream =
+                    await getLatestPublishedRelease(
+                      upstreamOwner,
+                      upstreamRepo
+                    );
+
+                  if (!latestUpstream) {
+                    console.log(
+                      'No published upstream release found; skipping release sync.'
+                    );
+                    process.exit(0);
+                  }
+
+                  console.log(
+                    `Latest upstream release: ${latestUpstream.tag_name}`
+                  );
+
+                  const {
+                    release: forkRelease,
+                    created,
+                  } = await ensureForkRelease(latestUpstream);
+
+                  await uploadMissingAssets(
+                    latestUpstream,
+                    forkRelease
+                  );
+
+                  if (!created) {
+                    console.log(
+                      'Release already existed; assets were checked for idempotent sync.'
+                    );
+                  }
+                  NODE
