@@ -9,7 +9,7 @@
  * 缓存判断逻辑：stats.json 修改时间 >= 缓存时间时，需要重新计算
  * 更新后首次运行会自动用当前时间创建新缓存，后续使用存储的缓存时间
  */
-const USAGES_CACHE_VERSION_TIMESTAMP = new Date('2026-09-29T00:00:00+08:00').getTime();
+const USAGES_CACHE_VERSION_TIMESTAMP = new Date('2026-10-06T00:00:00+08:00').getTime();
 
 import * as vscode from 'vscode';
 import * as fsSync from 'fs';
@@ -144,10 +144,12 @@ export class TokenFileLogger {
         // 今天/昨天只读原始 hourly .jsonl，不生成 requests.jsonl。
         void this.snapshotManager
             .compactHistoricalDates(this.startupHistoricalCompactionDaysThreshold)
-            .then(compactedCount => {
-                if (compactedCount > 0) {
+            .then(async compactedCount => {
+                const sanitizedCount =
+                    await this.snapshotManager.sanitizeHistoricalSnapshots(USAGES_CACHE_VERSION_TIMESTAMP);
+                if (compactedCount > 0 || sanitizedCount > 0) {
                     StatusLogger.info(
-                        `[TokenFileLogger] Startup historical snapshot compaction cleaned ${compactedCount} date folders`
+                        `[TokenFileLogger] Startup usage history cleanup compacted ${compactedCount} date folders and sanitized ${sanitizedCount} snapshots`
                     );
                 }
             })
