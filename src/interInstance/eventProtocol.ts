@@ -138,6 +138,8 @@ export interface ApiKeyBalanceAssignmentResolvedEvent extends InterInstanceEvent
         targetInstanceId: string;
         authorityTerm: string;
         handled: boolean;
+        weightBlocked?: boolean;
+        assignmentInvalidated?: boolean;
         leaseId?: string;
         configId?: string;
         credentialId?: string;
@@ -340,6 +342,7 @@ export interface RemoteInstanceCapabilitiesEvent extends InterInstanceEventBase 
         targetInstanceId: string;
         extensionVersion: string;
         usagesQueryProtocolVersion: number;
+        authorityTerm?: string;
     };
 }
 
