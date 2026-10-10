@@ -62,6 +62,11 @@ jobs:
                   MERGE_STATUS=$?
                   set -e
 
+                  # 先把 workflow 冲突统一按 ours 解决，避免 unmerged 状态下
+                  # git restore 无法执行（如 modify/delete 冲突）。
+                  git checkout --ours -- .github/workflows 2>/dev/null || true
+                  git add -A .github/workflows 2>/dev/null || true
+
                   # 无论上游如何修改 .github/workflows/，
                   # 都完整恢复为合并前 fork 自己的版本。
                   #
