@@ -57,8 +57,10 @@ jobs:
                   #
                   # 暂时关闭 set -e，因为有 merge conflict 时
                   # git merge 会返回非 0；workflow 冲突我们可以自动处理。
+                  # 其余文件若产生文本冲突，优先采用 upstream 版本，
+                  # 尽量降低人工介入频率。
                   set +e
-                  git merge --no-ff --no-commit upstream/main
+                  git merge --no-ff --no-commit -X theirs upstream/main
                   MERGE_STATUS=$?
                   set -e
 
