@@ -1,5 +1,13 @@
 ﻿import * as fs from 'fs/promises';
 import * as path from 'path';
+import { withDirectoryLock } from './persistence/directoryLock';
+
+export class WritePermissionLostError extends Error {
+    constructor() {
+        super('Statistics write permission expired');
+        this.name = 'WritePermissionLostError';
+    }
+}
 
 export class AtomicJsonFile {
     private static readonly queues = new Map<string, Promise<void>>();
@@ -28,8 +36,12 @@ export class AtomicJsonFile {
     static async writeJsonAtomically(
         filePath: string,
         value: unknown,
-        serializer: (value: unknown) => string = value => JSON.stringify(value, null, 2)
+        serializer: (value: unknown) => string = value => JSON.stringify(value, null, 2),
+        canWrite?: () => boolean
     ): Promise<void> {
+        if (canWrite && !canWrite()) {
+            throw new WritePermissionLostError();
+        }
         const serialized = serializer(value);
         const dirPath = path.dirname(filePath);
         const tempPath = `${filePath}.${process.pid}.${Date.now().toString(36)}.${Math.random().toString(36).slice(2)}.tmp`;
@@ -39,7 +51,27 @@ export class AtomicJsonFile {
         try {
             await fs.writeFile(tempPath, serialized, 'utf-8');
             // rename 在 POSIX 上原子替换已存在目标；Windows (NTFS) 上同样会替换已存在文件
-            await this.renameWithRetry(tempPath, filePath);
+            if (canWrite) {
+                await withDirectoryLock(
+                    `${filePath}.commit.lock`,
+                    {
+                        waitMs: 10000,
+                        retryMs: 25,
+                        orphanMs: 60000,
+                        reclaimOrphanMs: 60000,
+                        timeoutMessage: `Timed out waiting for statistics commit: ${filePath}`,
+                        ownershipLost: () => new WritePermissionLostError(),
+                        assertActive: () => {
+                            if (!canWrite()) {
+                                throw new WritePermissionLostError();
+                            }
+                        }
+                    },
+                    () => this.renameWithRetry(tempPath, filePath, 5, canWrite)
+                );
+            } else {
+                await this.renameWithRetry(tempPath, filePath);
+            }
         } catch (error) {
             await fs.rm(tempPath, { force: true }).catch(() => undefined);
             throw error;
@@ -52,10 +84,18 @@ export class AtomicJsonFile {
      * 对这些瞬时错误退避重试，覆盖外部进程的短时占用。
      */
     private static readonly RENAME_RETRYABLE_CODES = new Set(['EPERM', 'EBUSY', 'EACCES', 'EEXIST']);
-    private static async renameWithRetry(src: string, dest: string, retries = 5): Promise<void> {
+    private static async renameWithRetry(
+        src: string,
+        dest: string,
+        retries = 5,
+        canWrite?: () => boolean
+    ): Promise<void> {
         let lastError: unknown;
         for (let attempt = 0; attempt <= retries; attempt++) {
             try {
+                if (canWrite && !canWrite()) {
+                    throw new WritePermissionLostError();
+                }
                 await fs.rename(src, dest);
                 return;
             } catch (error) {
