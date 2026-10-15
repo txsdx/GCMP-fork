@@ -83,8 +83,14 @@ export default function Page() {
                 <h2>{t('Auxiliary Model Configuration (Recommended)', '辅助模型配置（推荐）')}</h2>
                 <p>
                     {t(
-                        'VS Code uses lightweight models in the background for tasks like title generation, commit message creation, and search. Without configuration, it falls back to the built-in Copilot model and consumes your monthly quota. Point these tasks to GCMP models to save quota:',
-                        'VS Code 在后台使用轻量模型执行标题生成、提交信息创建、搜索等实用任务。未配置时会回退到 Copilot 内置模型并消耗月度额度。将这些任务指向 GCMP 模型可节省额度：'
+                        'GCMP does not override defaults owned by VS Code or other extensions. When utility models are not fully configured and the main-agent fallback is not enabled, startup guidance offers manual configuration or sets chat.byokUtilityModelDefault to mainAgent after you confirm. GCMP commit message generation and vision analysis still require their own model selections:',
+                        'GCMP 不会覆盖 VS Code 或其他插件的默认设置。辅助模型未完整配置且未启用跟随主模型时，启动引导会提示手动配置，或由你确认将 chat.byokUtilityModelDefault 设为 mainAgent。GCMP 提交消息生成和视觉分析仍需单独选择模型：'
+                    )}
+                </p>
+                <p>
+                    {t(
+                        'Copilot Harness is not yet fully supported. Startup guidance recommends switching to the default Local Agent only when no related global chat preference has been set; an explicit enabled or disabled setting suppresses the prompt. Changes are saved globally only after confirmation, without changing workspace settings. Existing chats may require starting a new chat and selecting Local Agent again.',
+                        'Copilot Harness 暂时未能得到完整支持，仅在尚未设置相关全局聊天偏好时，启动引导才会建议切换到默认的 Local Agent；已有明确的启用或关闭设置时不再提示。仅经你确认后保存全局设置，不修改工作区设置；已有会话可能需要新建并重新选择 Local Agent。'
                     )}
                 </p>
                 <pre>
@@ -101,10 +107,10 @@ export default function Page() {
                 </pre>
                 <p>
                     {t('You can also run ', '也可通过命令面板执行 ')}
-                    <code>{t('GCMP: Set Utility Model', 'GCMP: 设置辅助工具模型')}</code>
+                    <code>{t('GCMP: Set Auxiliary Preferences', 'GCMP: 设置辅助偏好')}</code>
                     {t(
-                        ' from the command palette, or click "Set Utility Model" in the daily stats menu of the status bar Token icon to configure in the visual panel.',
-                        '，或在状态栏 Token 消耗图标的每日统计菜单中点击「设置辅助工具模型」，在可视化面板统一配置。'
+                        ' from the command palette, or click "Set auxiliary preferences" in the daily stats menu of the status bar Token icon to configure in the visual panel.',
+                        '，或在状态栏 Token 消耗图标的每日统计菜单中点击「设置辅助偏好」，在可视化面板统一配置。'
                     )}
                 </p>
             </section>
