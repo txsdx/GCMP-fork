@@ -1,15 +1,26 @@
 ﻿import assert from 'node:assert/strict';
+import { once } from 'node:events';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { createServer, type ServerResponse } from 'node:http';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { Agent, fetch as undiciFetch } from 'undici';
+import { OpenAIError } from 'openai';
 import * as vscode from 'vscode';
 
 import { OpenAICustomHandler } from '../../src/handlers/openai/openaiCustomHandler';
 import { OpenAIHandler } from '../../src/handlers/openai/openaiHandler';
 import { OpenAIResponsesHandler } from '../../src/handlers/openai/openaiResponsesHandler';
+import { runStreamCleanup } from '../../src/handlers/openai/shared/streamCleanup';
 import { StreamReporter } from '../../src/handlers/streamReporter';
 import { TokenUsagesManager } from '../../src/usages/usagesManager';
 import type { GenericModelProvider } from '../../src/providers/genericModelProvider';
 import { ApiKeyManager } from '../../src/utils/config/apiKeyManager';
 import { ConfigManager } from '../../src/utils/config/configManager';
 import { ConfigSetStore } from '../../src/utils/config/configSetStore';
+import { HarRecorder } from '../../src/utils/net/harRecorder';
+import type { RequestDiagnosticEntry } from '../../src/utils/net/requestDiagnostics';
+import { Logger } from '../../src/utils/runtime/logger';
 import type { ModelConfig } from '../../src/types/sharedTypes';
 import {
     RetryProvider,
@@ -342,7 +353,7 @@ suite('OpenAI custom SSE lifecycle', () => {
         }
     }
 
-    for (const sdkMode of ['openai-sse', 'openai-responses'] as const) {
+    for (const sdkMode of ['openai-sse', 'openai-responses', 'openai'] as const) {
         for (const cancelAt of ['none', 'before', 'during']) {
             for (const outcome of ['resolve', 'reject']) {
                 test(`handler initialization cancellation: ${sdkMode}, ${cancelAt}, ${outcome}`, async () => {
@@ -362,9 +373,9 @@ suite('OpenAI custom SSE lifecycle', () => {
                     } as unknown as GenericModelProvider;
                     const openai = new OpenAIHandler(provider);
                     const handler =
-                        sdkMode === 'openai-sse' ?
-                            new OpenAICustomHandler(provider, openai)
-                        :   new OpenAIResponsesHandler(provider, openai);
+                        sdkMode === 'openai-sse' ? new OpenAICustomHandler(provider, openai)
+                        : sdkMode === 'openai-responses' ? new OpenAIResponsesHandler(provider, openai)
+                        : openai;
                     const source = trackedCancellation();
                     const originalGet = ApiKeyManager.getApiKeyForRequest;
                     const originalFetch = ConfigManager.createProxyAwareFetch;
@@ -373,6 +384,7 @@ suite('OpenAI custom SSE lifecycle', () => {
                     const storageError = new Error('secret storage unavailable');
                     let reads = 0;
                     let requests = 0;
+                    let dispatched = 0;
                     ApiKeyManager.getApiKeyForRequest = async () => {
                         reads++;
                         await Promise.resolve();
@@ -386,7 +398,7 @@ suite('OpenAI custom SSE lifecycle', () => {
                     };
                     ConfigManager.createProxyAwareFetch = () => async () => {
                         requests++;
-                        return successResponse(sdkMode === 'openai-sse' ? 'openai' : 'openai-responses');
+                        return successResponse(sdkMode === 'openai-responses' ? 'openai-responses' : 'openai');
                     };
                     TokenUsagesManager.instance.updateActualTokens = update => {
                         statuses.push(update.status);
@@ -403,12 +415,16 @@ suite('OpenAI custom SSE lifecycle', () => {
                             { report() {} },
                             'initialization-test',
                             'test-session',
-                            source.token
+                            source.token,
+                            undefined,
+                            () => {
+                                dispatched++;
+                            }
                         ];
                         const result =
-                            handler instanceof OpenAICustomHandler ?
-                                handler.handleRequest(...args)
-                            :   handler.handleResponsesRequest(...args);
+                            handler instanceof OpenAIResponsesHandler ?
+                                handler.handleResponsesRequest(...args)
+                            :   handler.handleRequest(...args);
                         if (cancelAt !== 'none') {
                             await assert.rejects(result, vscode.CancellationError);
                             assert.deepEqual(statuses, ['cancelled']);
@@ -421,6 +437,7 @@ suite('OpenAI custom SSE lifecycle', () => {
                         }
                         assert.equal(reads, cancelAt === 'before' ? 0 : 1);
                         assert.equal(requests, cancelAt === 'none' && outcome === 'resolve' ? 1 : 0);
+                        assert.equal(dispatched, requests);
                         assert.equal(source.subscriptions, source.disposals);
                     } finally {
                         ApiKeyManager.getApiKeyForRequest = originalGet;
@@ -669,4 +686,402 @@ suite('OpenAI custom SSE lifecycle', () => {
             ApiKeyManager.getApiKey = originalGetApiKey;
         }
     });
+});
+
+suite('OpenAI transport recovery diagnostics', () => {
+    const originalFetch = ConfigManager.createProxyAwareFetch;
+    const originalDebug = Logger.debug;
+    const originalWarn = Logger.warn;
+    const originalUpdate = TokenUsagesManager.instance.updateActualTokens;
+    const originalFlush = StreamReporter.prototype.flushAll;
+    const originalUsage = StreamReporter.prototype.reportUsage;
+    const originalMetrics = StreamReporter.prototype.finishMetrics;
+    let context: vscode.ExtensionContext;
+
+    setup(async () => {
+        context = createContext();
+        ApiKeyManager.initialize(context);
+        ConfigSetStore.initialize(context);
+        await ConfigSetStore.setSwitchMode(slot, 'off');
+        await ApiKeyManager.setApiKey(slot, 'transport-test-key');
+        TokenUsagesManager.instance.updateActualTokens = () => {};
+    });
+
+    teardown(() => {
+        ConfigManager.createProxyAwareFetch = originalFetch;
+        Logger.debug = originalDebug;
+        Logger.warn = originalWarn;
+        TokenUsagesManager.instance.updateActualTokens = originalUpdate;
+        StreamReporter.prototype.flushAll = originalFlush;
+        StreamReporter.prototype.reportUsage = originalUsage;
+        StreamReporter.prototype.finishMetrics = originalMetrics;
+        for (const disposable of context.subscriptions) {
+            disposable.dispose();
+        }
+    });
+
+    for (const preservePrimaryError of [false, true]) {
+        for (const failLogging of [false, true]) {
+            test(`cleanup preserves first failure and runs all steps: primary=${preservePrimaryError}, logger=${failLogging}`, () => {
+                const firstError = new Error('first cleanup failure');
+                const secondError = new Error('second cleanup failure');
+                const steps: string[] = [];
+                let warnings = 0;
+                Logger.warn = () => {
+                    warnings++;
+                    if (failLogging) {
+                        throw new Error('log backend failure');
+                    }
+                };
+                const cleanup = () =>
+                    runStreamCleanup(
+                        [
+                            () => {
+                                steps.push('first');
+                                throw firstError;
+                            },
+                            () => {
+                                steps.push('second');
+                                throw secondError;
+                            },
+                            () => {
+                                steps.push('listener');
+                            }
+                        ],
+                        preservePrimaryError
+                    );
+                if (preservePrimaryError) {
+                    assert.doesNotThrow(cleanup);
+                } else {
+                    assert.throws(cleanup, error => error === firstError);
+                }
+                assert.deepEqual(steps, ['first', 'second', 'listener']);
+                assert.equal(warnings, 2);
+            });
+        }
+    }
+
+    for (const sdkMode of ['openai', 'openai-responses', 'openai-sse'] as const) {
+        for (const ending of [
+            'before-output',
+            'after-text',
+            'after-text-flush-error',
+            'after-text-flush-logger-error',
+            'after-text-usage-error',
+            'after-text-metrics-error',
+            'after-text-metrics-logger-error',
+            'after-thinking',
+            'after-tool',
+            'host-cancel',
+            'host-cancel-metrics-error',
+            'host-cancel-metrics-logger-error',
+            'completed',
+            'completed-metrics-error',
+            'completed-metrics-logger-error',
+            'har-clone-failure',
+            'invalid-json',
+            'invalid-json-with-har',
+            'invalid-json-without-content-type'
+        ]) {
+            const invalidJson = ending.startsWith('invalid-json');
+            const missingContentType = ending === 'invalid-json-without-content-type';
+            const cancelledRequest = ending.startsWith('host-cancel');
+            const completedRequest = ending.startsWith('completed');
+            const failureEnding = ending.replace('-logger-error', '-error');
+            const failLogging = ending.endsWith('-logger-error');
+            if ((invalidJson && sdkMode === 'openai-sse') || (missingContentType && sdkMode !== 'openai-responses')) {
+                continue;
+            }
+            test(`real socket lifecycle: ${sdkMode}, ${ending}`, async () => {
+                const cleanupError = new Error('injected cleanup failure');
+                let failedWarnings = 0;
+                if (failLogging) {
+                    Logger.warn = (...args: Parameters<typeof originalWarn>) => {
+                        if (args[0] === '[OpenAI] Stream cleanup failed') {
+                            failedWarnings++;
+                            throw Object.assign(new Error('injected log backend failure'), { code: 'EIO' });
+                        }
+                        originalWarn.apply(Logger, args);
+                    };
+                }
+                const updates: Parameters<typeof originalUpdate>[0][] = [];
+                TokenUsagesManager.instance.updateActualTokens = update => {
+                    updates.push(update);
+                };
+                if (failureEnding === 'after-text-flush-error') {
+                    StreamReporter.prototype.flushAll = function (...args) {
+                        originalFlush.apply(this, args);
+                        throw cleanupError;
+                    };
+                } else if (failureEnding === 'after-text-usage-error') {
+                    StreamReporter.prototype.reportUsage = function (...args) {
+                        originalUsage.apply(this, args);
+                        throw cleanupError;
+                    };
+                } else if (failureEnding.endsWith('metrics-error')) {
+                    StreamReporter.prototype.finishMetrics = function () {
+                        originalMetrics.call(this);
+                        throw cleanupError;
+                    };
+                }
+                const cancellation = trackedCancellation();
+                const dispatcher = new Agent({ connections: 1 });
+                const recorder = new HarRecorder();
+                const capturePath =
+                    ending === 'har-clone-failure' || ending === 'invalid-json-with-har' ?
+                        await mkdtemp(join(tmpdir(), 'gcmp-har-recovery-'))
+                    :   undefined;
+                if (capturePath) {
+                    recorder.initialize({
+                        enabled: true,
+                        extensionVersion: 'test',
+                        defaultStoragePath: capturePath,
+                        retentionCount: 2
+                    });
+                }
+                const entries: RequestDiagnosticEntry[] = [];
+                const parts: vscode.LanguageModelResponsePart[] = [];
+                const observed = { grants: 0 };
+                const partial = ending.startsWith('after-');
+                const success = await successResponse(
+                    sdkMode === 'openai-responses' ? 'openai-responses' : 'openai'
+                ).text();
+                const delta =
+                    ending === 'after-tool' ?
+                        {
+                            tool_calls: [
+                                {
+                                    index: 0,
+                                    id: 'call-test',
+                                    type: 'function',
+                                    function: { name: 'read_file', arguments: '{"path":"test.ts"}' }
+                                }
+                            ]
+                        }
+                    : ending === 'after-thinking' ? { reasoning_content: 'partial reasoning' }
+                    : { content: 'partial text' };
+                const responseItem = {
+                    id: 'call-item',
+                    type: 'function_call',
+                    call_id: 'call-test',
+                    name: 'read_file',
+                    arguments: '{"path":"test.ts"}'
+                };
+                const events =
+                    sdkMode === 'openai-responses' ?
+                        [
+                            {
+                                type: 'response.created',
+                                response: { id: 'partial-response', status: 'in_progress', output: [] }
+                            },
+                            ...(ending === 'after-tool' ?
+                                [
+                                    {
+                                        type: 'response.output_item.added',
+                                        output_index: 0,
+                                        item: { ...responseItem, arguments: '' }
+                                    },
+                                    {
+                                        type: 'response.function_call_arguments.done',
+                                        item_id: 'call-item',
+                                        output_index: 0,
+                                        arguments: responseItem.arguments
+                                    },
+                                    { type: 'response.output_item.done', output_index: 0, item: responseItem }
+                                ]
+                            :   [
+                                    {
+                                        type:
+                                            ending === 'after-thinking' ?
+                                                'response.reasoning_summary_text.delta'
+                                            :   'response.output_text.delta',
+                                        item_id: 'message-test',
+                                        output_index: 0,
+                                        content_index: 0,
+                                        summary_index: 0,
+                                        delta: 'partial text'
+                                    }
+                                ])
+                        ]
+                    :   [
+                            {
+                                id: 'chat-partial',
+                                object: 'chat.completion.chunk',
+                                created: 0,
+                                model: 'retry-model',
+                                choices: [
+                                    {
+                                        index: 0,
+                                        delta: { role: 'assistant', ...delta },
+                                        finish_reason: ending === 'after-tool' ? 'tool_calls' : null
+                                    }
+                                ]
+                            }
+                        ];
+                const prefix =
+                    invalidJson ? 'data: {not-json}\n\n'
+                    : partial ? events.map(event => `data: ${JSON.stringify(event)}\n\n`).join('')
+                    : ': heartbeat\n\n';
+                let requests = 0;
+                let pendingResponse: ServerResponse | undefined;
+                const server = createServer((request, response) => {
+                    request.resume();
+                    requests++;
+                    response.writeHead(200, {
+                        ...(missingContentType ? {} : { 'content-type': 'text/event-stream' }),
+                        'x-request-id': `local-${requests}`
+                    });
+                    if (requests > 1 || completedRequest || ending === 'har-clone-failure') {
+                        response.end(success);
+                    } else {
+                        pendingResponse = response;
+                        response.write(prefix);
+                    }
+                });
+                Logger.debug = (...args: Parameters<typeof originalDebug>) => {
+                    if (args[0] !== '[Request lifecycle]') {
+                        return;
+                    }
+                    const entry = args[1] as RequestDiagnosticEntry;
+                    entries.push(entry);
+                    const trigger = partial ? 'first_progress' : 'first_data';
+                    if (
+                        entry.attempt === 1 &&
+                        entry.phase === trigger &&
+                        !completedRequest &&
+                        ending !== 'har-clone-failure' &&
+                        !invalidJson
+                    ) {
+                        if (cancelledRequest) {
+                            cancellation.cancel();
+                        } else {
+                            pendingResponse?.destroy();
+                        }
+                    }
+                };
+                server.listen(0, '127.0.0.1');
+                await once(server, 'listening');
+                const address = server.address();
+                assert.ok(address && typeof address === 'object');
+                const fetchImpl: typeof fetch = async (input, init) => {
+                    const request = new Request(input, init);
+                    const headers: Record<string, string> = {};
+                    request.headers.forEach((value, key) => {
+                        headers[key] = value;
+                    });
+                    const response = await undiciFetch(
+                        `http://127.0.0.1:${address.port}${new URL(request.url).pathname}`,
+                        {
+                            method: request.method,
+                            headers,
+                            body: await request.text(),
+                            signal: request.signal,
+                            dispatcher
+                        }
+                    );
+                    if (ending === 'har-clone-failure') {
+                        Object.defineProperty(response, 'clone', {
+                            value: () => {
+                                throw new TypeError('injected_capture_clone_failure');
+                            }
+                        });
+                    }
+                    return response as unknown as Response;
+                };
+                ConfigManager.createProxyAwareFetch = () => recorder.wrapFetch(fetchImpl);
+                try {
+                    const result = RetryProvider.run(
+                        sdkMode,
+                        { ...defaultRetry, maxAttempts: 1 },
+                        observed,
+                        cancellation.token,
+                        parts,
+                        'socket-request'
+                    );
+                    if (partial) {
+                        await assert.rejects(result, error => {
+                            assert.ok(error instanceof Error);
+                            assert.equal(error.message, 'terminated');
+                            assert.ok(error.cause && typeof error.cause === 'object');
+                            const transportError = sdkMode === 'openai' ? error.cause : error;
+                            if (sdkMode === 'openai') {
+                                assert.ok(error instanceof OpenAIError);
+                            }
+                            assert.ok(transportError instanceof TypeError);
+                            assert.equal((transportError.cause as { code?: string }).code, 'UND_ERR_SOCKET');
+                            return true;
+                        });
+                    } else if (cancelledRequest) {
+                        await assert.rejects(result, vscode.CancellationError);
+                    } else if (failureEnding === 'completed-metrics-error') {
+                        await assert.rejects(result, error => error === cleanupError);
+                    } else if (invalidJson) {
+                        await assert.rejects(result, error => {
+                            assert.ok(error instanceof Error);
+                            assert.ok(error instanceof SyntaxError || error.cause instanceof SyntaxError);
+                            return true;
+                        });
+                    } else {
+                        await result;
+                    }
+                    const expected = ending === 'before-output' ? 2 : 1;
+                    assert.equal(requests, expected);
+                    assert.equal(observed.grants, expected);
+                    assert.equal(cancellation.disposals, cancellation.subscriptions);
+                    assert.equal(failedWarnings > 0, failLogging);
+                    assert.equal(entries.filter(entry => entry.phase === 'started').length, expected);
+                    const firstFailure = entries.find(entry => entry.phase === 'error');
+                    const decision = entries.find(entry => entry.phase === 'retry_decision');
+                    if (ending === 'completed' || ending === 'har-clone-failure') {
+                        assert.equal(firstFailure, undefined);
+                        assert.equal(decision, undefined);
+                        assert.equal(entries.at(-1)?.outcome, 'completed');
+                    } else if (cancelledRequest) {
+                        assert.equal(decision?.reason, 'cancelled');
+                        assert.equal(entries.at(-1)?.outcome, 'cancelled');
+                        assert.ok(entries.some(entry => entry.source === 'host_token'));
+                    } else if (failureEnding === 'completed-metrics-error') {
+                        assert.equal(decision?.retry, false);
+                        assert.equal(entries.at(-1)?.outcome, 'failed');
+                    } else if (invalidJson) {
+                        assert.ok(firstFailure?.errors?.some(error => error.name === 'SyntaxError'));
+                        assert.equal(
+                            firstFailure?.errors?.some(error => error.code === 'ERR_INVALID_STATE'),
+                            false
+                        );
+                        assert.equal(decision?.retry, false);
+                        assert.equal(decision?.reason, 'unclassified_error');
+                        assert.equal(entries.at(-1)?.outcome, 'failed');
+                        assert.equal(cancellation.token.isCancellationRequested, false);
+                    } else {
+                        assert.ok(firstFailure?.errors?.some(error => error.code === 'UND_ERR_SOCKET'));
+                        assert.equal(firstFailure?.signalAborted, false);
+                        assert.equal(decision?.retry, !partial);
+                        assert.equal(decision?.reason, partial ? 'progress_reported' : 'retryable_error');
+                        assert.equal(entries.at(-1)?.outcome, partial ? 'failed' : 'completed');
+                        if (sdkMode === 'openai-sse') {
+                            const cleanup = entries.find(entry => entry.source === 'finally_cleanup');
+                            assert.ok(cleanup);
+                            assert.equal(cleanup.firstErrorAt, firstFailure.firstErrorAt);
+                            assert.deepEqual(cleanup.errors, firstFailure.errors);
+                        }
+                    }
+                    if (partial) {
+                        assert.ok(parts.length > 0);
+                        assert.equal(updates.filter(update => update.status === 'failed').length, 1);
+                    }
+                } finally {
+                    cancellation.cancel();
+                    cancellation.dispose();
+                    await dispatcher.destroy();
+                    server.closeAllConnections();
+                    await new Promise<void>(resolve => server.close(() => resolve()));
+                    await recorder.dispose();
+                    if (capturePath) {
+                        await rm(capturePath, { recursive: true, force: true });
+                    }
+                }
+            });
+        }
+    }
 });

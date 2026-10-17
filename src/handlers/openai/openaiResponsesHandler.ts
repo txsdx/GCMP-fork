@@ -18,12 +18,15 @@ import {
 } from '../../utils/pricing/costCalculator';
 import { t } from '../../utils/runtime/l10n';
 import { Logger } from '../../utils/runtime/logger';
-import { copyFinalStatusRecorded, markFinalStatusRecorded } from '../../utils/runtime/finalStatusMarker';
+import { markFinalStatusRecorded } from '../../utils/runtime/finalStatusMarker';
+import { RequestDiagnostics } from '../../utils/net/requestDiagnostics';
 import { isCancellationError } from '../../utils/text/cancellationError';
 import { createOpenCodeHeaders } from '../../utils/text/formatUtils';
 import { getCustomHeaderDeletionMarkers } from '../../utils/net/httpHeaders';
 import { ModelChatResponseOptions, ModelConfig, ModelTokenPricing } from '../../types/sharedTypes';
-import { OpenAIHandler } from './openaiHandler';
+import type { OpenAIClientFactory } from './transport/clientFactory';
+import { openAIImages } from './shared/images';
+import { runStreamCleanup } from './shared/streamCleanup';
 import { StreamReporter } from '../streamReporter';
 import * as liveMetrics from '../liveMetrics';
 import type { GenericModelProvider } from '../../providers/genericModelProvider';
@@ -63,16 +66,16 @@ function compactUsageForLog(usage: GenericUsageData | undefined): Record<string,
  * 专门处理 Responses API 的消息转换和请求
  */
 export class OpenAIResponsesHandler {
-    private handler: OpenAIHandler;
+    private clientFactory: Pick<OpenAIClientFactory, 'createOpenAIClient'>;
     private messageConverter: OpenAIResponsesMessageConverter;
     private requestBuilder: OpenAIResponsesRequestBuilder;
 
     constructor(
         private providerInstance: GenericModelProvider,
-        handler: OpenAIHandler
+        clientFactory: Pick<OpenAIClientFactory, 'createOpenAIClient'>
     ) {
-        this.handler = handler;
-        this.messageConverter = new OpenAIResponsesMessageConverter(handler, this.displayName);
+        this.clientFactory = clientFactory;
+        this.messageConverter = new OpenAIResponsesMessageConverter(openAIImages, this.displayName);
         this.requestBuilder = new OpenAIResponsesRequestBuilder(
             this.displayName,
             this.messageConverter,
@@ -103,8 +106,24 @@ export class OpenAIResponsesHandler {
         token: vscode.CancellationToken,
         requestStartTime?: number,
         onRequestDispatched?: (requestMetricStartTime: number) => void,
-        wasThrottled = false
+        wasThrottled = false,
+        diagnostics?: RequestDiagnostics
     ): Promise<void> {
+        const trace =
+            diagnostics ??
+            new RequestDiagnostics(
+                {
+                    requestId,
+                    sessionId,
+                    subSessionId: (options.modelOptions as { subSessionId?: string })?.subSessionId,
+                    provider: modelConfig.provider || this.providerKey,
+                    modelId: model.id,
+                    sdkMode: 'openai-responses'
+                },
+                entry => Logger.debug('[Request lifecycle]', entry),
+                () => ({ tokenCancelled: token.isCancellationRequested })
+            );
+        let outcome: 'completed' | 'failed' | 'cancelled' = 'failed';
         Logger.debug(`${model.name} starting ${this.displayName} Responses API request handling`);
         let reporter: StreamReporter | undefined;
         let requestMetricStartTime = requestStartTime;
@@ -112,19 +131,24 @@ export class OpenAIResponsesHandler {
         try {
             // 将 vscode.CancellationToken 转换为 AbortSignal
             const abortController = new AbortController();
-            const cancellationListener = token.onCancellationRequested(() => abortController.abort());
+            trace.bindSignal(abortController.signal);
+            const cancellationListener = token.onCancellationRequested(() => {
+                trace.abort('host_token');
+                abortController.abort();
+            });
             let finalUsage: GenericUsageData | undefined = undefined;
             let finishReason: string | null = null;
             // 记录流处理的开始和结束时间（response.created 到达前为 undefined，避免使用进入函数的旧时间）
             let streamStartTime: number | undefined;
             let streamEndTime: number | undefined = undefined;
             let streamProcessor: OpenAIResponsesStreamProcessor | undefined;
+            let streamFailed = false;
 
             try {
                 if (token.isCancellationRequested) {
                     throw new vscode.CancellationError();
                 }
-                const client = await this.handler.createOpenAIClient(modelConfig, sessionId);
+                const client = await this.clientFactory.createOpenAIClient(modelConfig, sessionId, trace);
                 if (token.isCancellationRequested) {
                     throw new vscode.CancellationError();
                 }
@@ -153,7 +177,12 @@ export class OpenAIResponsesHandler {
                     modelId: model.id,
                     provider: modelConfig.provider || this.providerKey,
                     sdkMode: 'openai-responses',
-                    progress,
+                    progress: {
+                        report: part => {
+                            trace.progress();
+                            progress.report(part);
+                        }
+                    },
                     sessionId,
                     subSessionId: (options.modelOptions as { subSessionId?: string })?.subSessionId,
                     requestId,
@@ -183,8 +212,8 @@ export class OpenAIResponsesHandler {
                     streamReporter,
                     sessionId
                 });
-                streamProcessor.attach();
-                await streamProcessor.consume(stream);
+                streamProcessor.attach(trace);
+                await streamProcessor.consume(stream, trace);
 
                 finalUsage = streamProcessor.getFinalUsage();
                 finishReason = streamProcessor.getFinishReason();
@@ -208,18 +237,27 @@ export class OpenAIResponsesHandler {
                 });
                 streamStartTime = completionResult.streamStartTime;
             } catch (error) {
+                streamFailed = true;
+                trace.error(error);
                 if (token.isCancellationRequested || isCancellationError(error)) {
+                    outcome = 'cancelled';
                     streamStartTime ??= streamProcessor?.getStreamStartTime() ?? reporter?.getMetricStreamStartTime();
                     streamEndTime ??= streamProcessor?.getStreamEndTime() ?? Date.now();
-                    this.reportCancellation({
-                        modelName: model.name,
-                        requestId,
-                        sessionId,
-                        requestMetricStartTime,
-                        streamStartTime,
-                        streamEndTime,
-                        wasThrottled
-                    });
+                    runStreamCleanup(
+                        [
+                            () =>
+                                this.reportCancellation({
+                                    modelName: model.name,
+                                    requestId,
+                                    sessionId,
+                                    requestMetricStartTime,
+                                    streamStartTime,
+                                    streamEndTime,
+                                    wasThrottled
+                                })
+                        ],
+                        true
+                    );
                     throw new vscode.CancellationError();
                 } else {
                     streamStartTime ??= streamProcessor?.getStreamStartTime() ?? reporter?.getMetricStreamStartTime();
@@ -245,36 +283,57 @@ export class OpenAIResponsesHandler {
                                 costNanoAiu = toNanoAiu(breakdown.total);
                             }
                         }
-                        reporter.reportUsage(finalUsage, costNanoAiu);
-                        if (!streamProcessor?.isResponseFinalized()) {
-                            reporter.flushAll(null, undefined, finalUsage);
-                        }
-                        TokenUsagesManager.instance.updateActualTokens({
-                            requestId,
-                            sessionId,
-                            rawUsage: finalUsage,
-                            status: 'failed',
-                            ...(requestMetricStartTime !== undefined ? { requestMetricStartTime } : {}),
-                            wasThrottled,
-                            streamStartTime,
-                            streamEndTime,
-                            estimatedCost: breakdown?.total,
-                            costBreakdown: breakdown ? toCostBreakdownLog(breakdown) : undefined
-                        });
-                        markFinalStatusRecorded(error);
+                        runStreamCleanup(
+                            [
+                                () => reporter?.reportUsage(finalUsage, costNanoAiu),
+                                () => {
+                                    if (!streamProcessor?.isResponseFinalized()) {
+                                        reporter?.flushAll(null, undefined, finalUsage);
+                                    }
+                                },
+                                () => {
+                                    TokenUsagesManager.instance.updateActualTokens({
+                                        requestId,
+                                        sessionId,
+                                        rawUsage: finalUsage,
+                                        status: 'failed',
+                                        ...(requestMetricStartTime !== undefined ? { requestMetricStartTime } : {}),
+                                        wasThrottled,
+                                        streamStartTime,
+                                        streamEndTime,
+                                        estimatedCost: breakdown?.total,
+                                        costBreakdown: breakdown ? toCostBreakdownLog(breakdown) : undefined
+                                    });
+                                    markFinalStatusRecorded(error);
+                                }
+                            ],
+                            true
+                        );
                     }
                     Logger.error(`${model.name} Responses API stream processing error: ${error}`);
                     throw error;
                 }
             } finally {
-                cancellationListener.dispose();
+                runStreamCleanup([() => cancellationListener.dispose()], streamFailed);
             }
 
-            Logger.debug(`✅ ${model.name} ${this.displayName} Responses API request completed`);
+            outcome = token.isCancellationRequested ? 'cancelled' : 'completed';
+            Logger.debug(`${model.name} ${this.displayName} Responses API request ${outcome}`);
         } catch (error) {
+            trace.error(error);
             this.rethrowResponsesError(error, model.name);
         } finally {
-            reporter?.finishMetrics();
+            runStreamCleanup(
+                [
+                    () => reporter?.finishMetrics(),
+                    () => {
+                        if (!diagnostics) {
+                            trace.finish(outcome);
+                        }
+                    }
+                ],
+                outcome !== 'completed'
+            );
         }
     }
 
@@ -396,7 +455,7 @@ export class OpenAIResponsesHandler {
             streamEndTime,
             wasThrottled
         } = params;
-        Logger.info(`${modelName} Responses API request was cancelled by the user`);
+        Logger.info(`${modelName} Responses API request was cancelled`);
         // 记录取消状态（同步调用，内部写盘 fire-and-forget，不阻塞取消链路）
         TokenUsagesManager.instance.updateActualTokens({
             requestId,
@@ -432,28 +491,10 @@ export class OpenAIResponsesHandler {
                 if (causeMessage && causeMessage !== errorMessage) {
                     errorMessage = causeMessage;
                     Logger.debug(`${modelName} Extracted detailed error message from error.cause: ${errorMessage}`);
-                    copyFinalStatusRecorded(error, error.cause);
-                    throw error.cause;
                 }
             }
 
             Logger.error(`${modelName} ${this.displayName} Responses API request failed: ${errorMessage}`);
-
-            if (
-                errorMessage.includes('502') ||
-                errorMessage.includes('Bad Gateway') ||
-                errorMessage.includes('500') ||
-                errorMessage.includes('Internal Server Error') ||
-                errorMessage.includes('503') ||
-                errorMessage.includes('Service Unavailable') ||
-                errorMessage.includes('504') ||
-                errorMessage.includes('Gateway Timeout')
-            ) {
-                const wrappedError = new vscode.LanguageModelError(errorMessage);
-                copyFinalStatusRecorded(error, wrappedError);
-                throw wrappedError;
-            }
-
             throw error;
         }
 

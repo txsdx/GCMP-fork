@@ -24,6 +24,7 @@ import { isDashscopeProviderSlot, resolveDashscopeBaseUrl } from '../utils/net/d
 import { createLanguageModelChatInformation } from '../utils/model/languageModelInfo';
 import { isCancellationError } from '../utils/text/cancellationError';
 import { Logger } from '../utils/runtime/logger';
+import { RequestDiagnostics } from '../utils/net/requestDiagnostics';
 import { t } from '../utils/runtime/l10n';
 import { hasFinalStatusRecorded } from '../utils/runtime/finalStatusMarker';
 import { ModelInfoCache } from '../utils/model/modelInfoCache';
@@ -35,6 +36,9 @@ import { getEffectiveMaxInputTokens } from '../utils/model/languageModelInfo';
 import type { RetryableError } from '../utils/retry/retryManager';
 import * as liveMetrics from '../handlers/liveMetrics';
 import { OpenAIHandler } from '../handlers/openai/openaiHandler';
+import { OpenAIClientFactory } from '../handlers/openai/transport/clientFactory';
+import { OpenAIChatMessageConverter } from '../handlers/openai/chat/messageConverter';
+import { OpenAIChatRequestBuilder } from '../handlers/openai/chat/requestBuilder';
 import { OpenAICustomHandler } from '../handlers/openai/openaiCustomHandler';
 import { AnthropicHandler } from '../handlers/anthropic/anthropicHandler';
 import { GeminiHandler, hasGeminiPartialUsage } from '../handlers/gemini/geminiHandler';
@@ -194,11 +198,18 @@ export class GenericModelProvider implements LanguageModelChatProvider {
         });
 
         // 创建 OpenAI SDK 处理器
-        this.openaiHandler = new OpenAIHandler(this);
+        const openaiClientFactory = new OpenAIClientFactory(this);
+        const openaiMessageConverter = new OpenAIChatMessageConverter(this);
+        const openaiRequestBuilder = new OpenAIChatRequestBuilder(this, openaiMessageConverter);
+        this.openaiHandler = new OpenAIHandler(this, {
+            clientFactory: openaiClientFactory,
+            messageConverter: openaiMessageConverter,
+            requestBuilder: openaiRequestBuilder
+        });
         // 创建 OpenAI 自定义 SSE 处理器
-        this.openaiCustomHandler = new OpenAICustomHandler(this, this.openaiHandler);
+        this.openaiCustomHandler = new OpenAICustomHandler(this, openaiRequestBuilder);
         // 创建 OpenAI Responses API 处理器
-        this.openaiResponsesHandler = new OpenAIResponsesHandler(this, this.openaiHandler);
+        this.openaiResponsesHandler = new OpenAIResponsesHandler(this, openaiClientFactory);
         // 创建 Anthropic SDK 处理器
         this.anthropicHandler = new AnthropicHandler(this);
         this.geminiHandler = new GeminiHandler(this);
@@ -973,6 +984,8 @@ export class GenericModelProvider implements LanguageModelChatProvider {
         let summaryResponseBuffer = '';
         let hasReportedProgress = false;
         let attemptDispatched = false;
+        let attemptDiagnostics: RequestDiagnostics | undefined;
+        let requestOutcome: 'completed' | 'failed' | 'cancelled' = 'failed';
         const requestMetadata = this.getEstimatedRequestMetadata(options);
 
         try {
@@ -1017,6 +1030,20 @@ export class GenericModelProvider implements LanguageModelChatProvider {
 
             await retryManager.executeWithRetry(
                 async () => {
+                    attemptDiagnostics?.finish('failed');
+                    attemptDiagnostics = new RequestDiagnostics(
+                        {
+                            requestId,
+                            sessionId,
+                            subSessionId,
+                            attempt: retryAttempt + 1,
+                            provider: effectiveProviderKey,
+                            modelId: model.id,
+                            sdkMode
+                        },
+                        entry => Logger.debug('[Request lifecycle]', entry),
+                        () => ({ tokenCancelled: token.isCancellationRequested, hasReportedProgress })
+                    );
                     // 标题响应按 attempt 独立累积，避免重试时拼接上一轮的半截文本
                     titleResponseBuffer = '';
                     summaryResponseBuffer = '';
@@ -1309,7 +1336,8 @@ export class GenericModelProvider implements LanguageModelChatProvider {
                                 token,
                                 requestStartTime,
                                 handleRequestDispatched,
-                                wasThrottled
+                                wasThrottled,
+                                attemptDiagnostics
                             );
                         } else if (sdkMode === 'openai-responses') {
                             await this.openaiResponsesHandler.handleResponsesRequest(
@@ -1323,7 +1351,8 @@ export class GenericModelProvider implements LanguageModelChatProvider {
                                 token,
                                 requestStartTime,
                                 handleRequestDispatched,
-                                wasThrottled
+                                wasThrottled,
+                                attemptDiagnostics
                             );
                         } else {
                             await this.openaiHandler.handleRequest(
@@ -1337,7 +1366,8 @@ export class GenericModelProvider implements LanguageModelChatProvider {
                                 token,
                                 requestStartTime,
                                 handleRequestDispatched,
-                                wasThrottled
+                                wasThrottled,
+                                attemptDiagnostics
                             );
                         }
                         if (token.isCancellationRequested) {
@@ -1353,7 +1383,9 @@ export class GenericModelProvider implements LanguageModelChatProvider {
                             failoverFailureRequestId = crypto.randomUUID();
                         }
                         failoverFailureCount = 0;
+                        attemptDiagnostics.finish('completed');
                     } catch (caught) {
+                        attemptDiagnostics.error(caught);
                         const error =
                             typeof caught === 'object' && caught !== null ?
                                 caught
@@ -1423,23 +1455,42 @@ export class GenericModelProvider implements LanguageModelChatProvider {
                     }
                 },
                 error => {
-                    if (
-                        !attemptDispatched ||
-                        token.isCancellationRequested ||
-                        !isApiKeyFailoverError(error) ||
-                        hasReportedProgress ||
-                        hasGeminiPartialUsage(error)
-                    ) {
-                        return false;
+                    attemptDiagnostics?.error(error);
+                    const decide = (retry: boolean, reason: string): boolean => {
+                        attemptDiagnostics?.decision(
+                            retry && retryConfig.enabled,
+                            retry && !retryConfig.enabled ? 'retry_disabled' : reason
+                        );
+                        return retry;
+                    };
+                    if (!attemptDispatched) {
+                        return decide(false, 'not_dispatched');
+                    }
+                    if (token.isCancellationRequested || !isApiKeyFailoverError(error)) {
+                        return decide(false, 'cancelled');
+                    }
+                    if (hasReportedProgress) {
+                        return decide(false, 'progress_reported');
+                    }
+                    if (hasGeminiPartialUsage(error)) {
+                        return decide(false, 'partial_usage');
                     }
                     if (typeof error === 'object' && failoverRetryDecisions.has(error)) {
-                        return failoverRetryDecisions.get(error) === true;
+                        const retry = failoverRetryDecisions.get(error) === true;
+                        return decide(
+                            retry,
+                            retry ? 'failover_retry'
+                            : retryConfig.maxAttempts !== -1 && retryAttempt >= retryConfig.maxAttempts ?
+                                'budget_exhausted'
+                            :   'failover_declined'
+                        );
                     }
                     if (configuredRetryConfig.maxAttempts !== -1 && retryAttempt >= configuredRetryConfig.maxAttempts) {
-                        return false;
+                        return decide(false, 'budget_exhausted');
                     }
                     const fallback = this.shouldRetryRequest(error);
-                    return sdkMode === 'anthropic' ? shouldRetryAnthropicRequest(error, fallback) : fallback;
+                    const retry = sdkMode === 'anthropic' ? shouldRetryAnthropicRequest(error, fallback) : fallback;
+                    return decide(retry, retry ? 'retryable_error' : 'unclassified_error');
                 },
                 this.providerConfig.displayName,
                 {
@@ -1466,6 +1517,7 @@ export class GenericModelProvider implements LanguageModelChatProvider {
                 }
             );
 
+            requestOutcome = 'completed';
             if (isSummarizationRequest && summaryResponseBuffer.trim()) {
                 SessionRecoveryService.instance.rememberSummarization(sessionId, summaryResponseBuffer, {
                     requestClassification,
@@ -1498,11 +1550,18 @@ export class GenericModelProvider implements LanguageModelChatProvider {
                 }
             }
         } catch (error) {
+            attemptDiagnostics?.error(error);
+            if (isCancellationError(error)) {
+                requestOutcome = 'cancelled';
+            }
             if (token.isCancellationRequested) {
+                requestOutcome = 'cancelled';
+                attemptDiagnostics?.abort('host_token');
                 throw new vscode.CancellationError();
             }
             throw error;
         } finally {
+            attemptDiagnostics?.finish(requestOutcome);
             if (balanceLeaseId) {
                 ApiKeyFailoverManager.releaseBalanceLease(balanceLeaseId);
                 balanceLeaseId = undefined;
