@@ -60,6 +60,7 @@
     "setting.proxy.description": "全局代理服务器地址，用于所有 API 请求。模型级别和提供商级别的代理设置优先于此设置。URL 中的凭据将在日志中被脱敏。像 127.0.0.1:7890 这样的 host:port 可省略协议。填写“noproxy”可显式绕过已配置代理和系统代理。",
     "setting.machineOverrides.description": "以区分大小写的 Provider ID 为键配置当前机器专属覆盖，键名必须与模型或内置 Provider ID 完全一致。目前支持配置 Provider 级 proxy，或在 models 中按 id 配置模型级 proxy。代理值可为 URL 或 noproxy。此设置仅保存在本机，不参与设置同步。",
     "setting.tls.useSystemCertificates.description": "将操作系统信任的根证书追加到 Node.js 默认 CA 列表中，用于缓解企业代理、内网网关或本地安装根证书场景下的 SSL 证书校验失败。建议保持开启。",
+    "setting.codex.allowCustomProviderWithoutUsage.description": "使用 ~/.codex/config.toml 中当前启用的自定义模型提供商，无需支持 ChatGPT 用量查询。此模式下 Codex 模型仍可使用，但不显示 ChatGPT 订阅余量。",
     "setting.maxTokens.description": "控制AI模型输出的最大token数量。较大的值允许更长的响应。",
     "setting.maxTokens.deprecation": "已弃用：此设置已不再生效，各模型现在自动使用自身的 maxOutputTokens 配置。",
     "setting.retry.enabled.description": "启用自动重试功能，用于处理 429 限流、503 服务繁忙等可重试错误。关闭后请求失败将直接停止，不再重试。",

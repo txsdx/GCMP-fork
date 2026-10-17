@@ -107,8 +107,8 @@ export class InlineCompletionShim implements vscode.InlineCompletionItemProvider
                 mainExtensionWarningShown = true;
                 void vscode.window.showWarningMessage(
                     t(
-                        'FIM/NES completion requires the GCMP main extension (vicanent.gcmp). Install or enable it and reload the window.',
-                        'FIM/NES 补全依赖 GCMP 主扩展 (vicanent.gcmp)，请安装或启用后重新加载窗口。'
+                        'FIM/NES completion requires the GCMP main extension (vicanent.gcmp-fork). Install or enable it and reload the window.',
+                        'FIM/NES 补全依赖 GCMP 主扩展 (vicanent.gcmp-fork)，请安装或启用后重新加载窗口。'
                     )
                 );
             }

@@ -56,7 +56,7 @@ interface CompletionSchema {
 }
 
 function fixture() {
-    const registry = new Map<string, { isActive: boolean; exports: unknown }>();
+    const registry = new Map<string, { isActive: boolean; exports: unknown; packageJSON?: { version: string } }>();
     const channels: Array<{ disposed: boolean; dispose(): void }> = [];
     const registrations: Array<{ disposed: boolean }> = [];
     const commands = new Set<string>();
@@ -314,7 +314,7 @@ function fixture() {
     }
     const bridge = load<Bridge>(resolve(child, 'src/gcmpServices.ts'));
     const connect = () =>
-        registry.set('vicanent.gcmp', {
+        registry.set('vicanent.gcmp-fork', {
             isActive: true,
             exports: {
                 verifyCompletionServices: (candidate: object) => candidate === services,
@@ -397,7 +397,7 @@ test('native log methods reject writes after disposal', () => {
 for (const active of [false, true]) {
     test(`global singleton cannot authorize services (main active=${active})`, () => {
         const f = fixture();
-        f.registry.set('vicanent.gcmp', { isActive: active, exports: {} });
+        f.registry.set('vicanent.gcmp-fork', { isActive: active, exports: {} });
         for (const sandbox of f.sandboxes) {
             sandbox.__gcmp_singletons = { ...f.services, CompletionLogger: {}, StatusBarManager: {} };
         }
@@ -405,6 +405,53 @@ for (const active of [false, true]) {
         assert.throws(() => f.bridge.getApiKeyManager(), /required/);
     });
 }
+
+test('completion manifest depends only on the fork main extension', () => {
+    const manifest = JSON.parse(readFileSync(resolve(child, 'package.json'), 'utf8')) as {
+        extensionDependencies: string[];
+    };
+    const main = JSON.parse(readFileSync(resolve(root, 'package.json'), 'utf8')) as {
+        publisher: string;
+        name: string;
+    };
+    assert.deepEqual(manifest.extensionDependencies, ['vicanent.gcmp-fork']);
+    assert.equal(manifest.extensionDependencies[0], `${main.publisher}.${main.name}`);
+});
+
+test('original main cannot authorize services or activate the fork companion', async () => {
+    const f = fixture();
+    f.registry.set('vicanent.gcmp', {
+        isActive: true,
+        exports: {
+            verifyCompletionServices: () => true,
+            notifyConsumerReady: noop
+        }
+    });
+    f.bridge.acceptCompletionServices(f.services);
+    assert.equal(f.bridge.isGcmpServicesAvailable(), false);
+    const entry = f.load<Entry>(resolve(child, 'src/extension.ts'));
+    await assert.rejects(entry.activate({ subscriptions: [] }), /GCMP.*bridge/i);
+    assert.equal(f.registrations.length, 0);
+});
+
+test('version manager reads the fork version instead of the original main version', () => {
+    const f = fixture();
+    f.registry.set('vicanent.gcmp', {
+        isActive: true,
+        exports: {},
+        packageJSON: { version: '1.0.0' }
+    });
+    f.registry.set('vicanent.gcmp-fork', {
+        isActive: true,
+        exports: {},
+        packageJSON: { version: '2.0.0' }
+    });
+    const { VersionManager } = f.load<typeof import('../utils/versionManager')>(
+        resolve(child, 'src/utils/versionManager.ts')
+    );
+    assert.equal(VersionManager.getVersion(), '2.0.0');
+    assert.equal(VersionManager.getUserAgent('completion'), 'GCMP-completion/2.0.0');
+});
 
 test('minimal verified bridge works without status bars', async () => {
     const f = fixture();
@@ -433,7 +480,7 @@ test('forged services cannot replace an accepted reference', () => {
 test('inactive main cannot verify even the correct reference', () => {
     const f = fixture();
     f.connect();
-    f.registry.get('vicanent.gcmp')!.isActive = false;
+    f.registry.get('vicanent.gcmp-fork')!.isActive = false;
     f.bridge.acceptCompletionServices(f.services);
     assert.equal(f.bridge.isGcmpServicesAvailable(), false);
 });
@@ -446,13 +493,13 @@ test('verified but incomplete method sets are rejected', () => {
             StatusBarManager: {},
             ConfigManager: { ...f.services.ConfigManager, [key]: undefined }
         };
-        f.registry.set('vicanent.gcmp', { isActive: true, exports: { verifyCompletionServices: () => true } });
+        f.registry.set('vicanent.gcmp-fork', { isActive: true, exports: { verifyCompletionServices: () => true } });
         f.bridge.acceptCompletionServices(candidate);
         assert.equal(f.bridge.isGcmpServicesAvailable(), false, key);
     }
     for (const key of ['ApiKeyManager', 'closeProxyAgents', 'getAvailableProviders'] as const) {
         const f = fixture();
-        f.registry.set('vicanent.gcmp', { isActive: true, exports: { verifyCompletionServices: () => true } });
+        f.registry.set('vicanent.gcmp-fork', { isActive: true, exports: { verifyCompletionServices: () => true } });
         f.bridge.acceptCompletionServices({ ...f.services, StatusBarManager: {}, [key]: undefined });
         assert.equal(f.bridge.isGcmpServicesAvailable(), false, key);
     }
@@ -569,7 +616,7 @@ for (const main of [
     test(`incompatible main rejects activation before any registrations (${JSON.stringify(main)})`, async () => {
         const f = fixture();
         if (main) {
-            f.registry.set('vicanent.gcmp', main);
+            f.registry.set('vicanent.gcmp-fork', main);
         }
         const entry = f.load<Entry>(resolve(child, 'src/extension.ts'));
         const context = { subscriptions: [] };

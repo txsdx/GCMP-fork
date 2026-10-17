@@ -21,7 +21,7 @@
         "vscode": ">=1.138.0"
     },
     "extensionDependencies": [
-        "vicanent.gcmp"
+        "vicanent.gcmp-fork"
     ],
     "categories": [
         "AI"

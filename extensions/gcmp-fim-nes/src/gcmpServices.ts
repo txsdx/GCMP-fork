@@ -5,7 +5,7 @@ import type { ApiKeyManagerLike, ConfigManagerLike, GcmpCompletionServices } fro
 export { completionLogger } from './completionLogger';
 
 /** GCMP 主扩展标识 */
-export const GCMP_EXTENSION_ID = 'vicanent.gcmp';
+export const GCMP_EXTENSION_ID = 'vicanent.gcmp-fork';
 /** 本扩展标识（主扩展注入白名单校验用） */
 export const GCMP_FIM_NES_ID = 'vicanent.gcmp-fim-nes';
 
@@ -115,7 +115,7 @@ export function isGcmpServicesAvailable(): boolean {
 // ========================================================================
 
 function unavailableError(): Error {
-    return new Error('GCMP main extension (vicanent.gcmp) is required for FIM/NES completion');
+    return new Error('GCMP main extension (vicanent.gcmp-fork) is required for FIM/NES completion');
 }
 
 // ========================================================================

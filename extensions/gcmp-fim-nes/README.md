@@ -4,7 +4,7 @@ GCMP 主扩展的**可选代码补全扩展**，提供 FIM 行内补全与 NES �
 
 ## 安装与启用
 
-1. 使用 VS Code **1.138.0 或更高版本**，安装主扩展 [AI Chat Models](https://marketplace.visualstudio.com/items?itemName=vicanent.gcmp)。
+1. 使用 VS Code **1.138.0 或更高版本**，安装主扩展 **AI Chat Models Fork**（`vicanent.gcmp-fork`）。
 2. 在扩展视图搜索 `vicanent.gcmp-fim-nes`，手动点击「安装」。主扩展不会自动安装本扩展。
 3. 在主扩展中配置提供商 API Key，并按需配置补全模型及启用 `gcmp.fimCompletion.enabled` 或 `gcmp.nesCompletion.enabled`。两种模式默认关闭。
 
@@ -24,7 +24,7 @@ An **optional code completion companion** for GCMP, providing FIM inline complet
 
 ### Install and Enable
 
-1. Use **VS Code 1.138.0 or later** and install the main [AI Chat Models](https://marketplace.visualstudio.com/items?itemName=vicanent.gcmp) extension.
+1. Use **VS Code 1.138.0 or later** and install the main **AI Chat Models Fork** (`vicanent.gcmp-fork`) extension.
 2. Search for `vicanent.gcmp-fim-nes` in the Extensions view, then click **Install**. The main extension does not install this companion automatically.
 3. Configure the provider API key in the main extension, choose completion models, and enable `gcmp.fimCompletion.enabled` or `gcmp.nesCompletion.enabled` as needed. Both modes are disabled by default.
 

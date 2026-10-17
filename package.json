@@ -1320,7 +1320,7 @@
         "watch:fim-nes": "node extensions/gcmp-fim-nes/esbuild.config.js --watch --dev",
         "typecheck:fim-nes": "tsc --noEmit -p extensions/gcmp-fim-nes/tsconfig.json",
         "test:fim-nes": "node --import=tsx --test extensions/gcmp-fim-nes/src/**/*.test.ts",
-        "package:fim-nes": "cd extensions/gcmp-fim-nes && vsce package --no-dependencies",
+        "package:fim-nes": "cd extensions/gcmp-fim-nes && vsce package --no-dependencies && node -e \"const { name, version } = require('./package.json'); const file = name + '-' + version + '.vsix'; require('node:fs').copyFileSync(file, '../../' + file);\"",
         "package": "vsce package",
         "publish": "vsce publish --allow-proposed-apis chatProvider",
         "pretest": "npm run compile:dev",
