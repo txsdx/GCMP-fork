@@ -21,6 +21,8 @@ export interface CachedStatusData<T> {
     data: T;
     /** 缓存时间戳 */
     timestamp: number;
+    /** 余额快照对应的完整 API Key SHA-256；不包含明文密钥 */
+    requestBalanceKeyHash?: string;
 }
 
 /**
@@ -95,6 +97,7 @@ export abstract class BaseStatusBarItem<T> {
     protected queryGeneration = 0;
     private automaticRefreshPending = false;
     private automaticRefreshRetryCount = 0;
+    private delayedRefreshPending = false;
     private readonly MAX_AUTOMATIC_REFRESH_RETRIES = 3;
     protected initialized = false;
     protected statusBarEligible = false;
@@ -113,6 +116,7 @@ export abstract class BaseStatusBarItem<T> {
     // 最小延时更新间隔：节流阈值，避免短时间内多次 delayedUpdate 触发 API 请求
     // 30 秒是多数提供商限频窗口的下限，保证不会在同一窗口内重复请求
     protected readonly MIN_DELAYED_UPDATE_INTERVAL = 30000;
+    private readonly AUTOMATIC_REFRESH_CACHE_MS = 5000;
     // 缓存轮询间隔：仅从本地缓存读取并刷新状态栏显示（不触发 API）
     // 10 秒是 UI 响应性与无谓刷新的平衡点
     protected readonly CACHE_UPDATE_INTERVAL = 10000;
@@ -172,7 +176,13 @@ export abstract class BaseStatusBarItem<T> {
      * 执行 API 查询
      * @returns 查询结果
      */
-    protected abstract performApiQuery(): Promise<{ success: boolean; data?: T; error?: string }>;
+    protected abstract performApiQuery(): Promise<{
+        success: boolean;
+        data?: T;
+        error?: string;
+        requestBalanceKeyHash?: string;
+        queriedAt?: number;
+    }>;
 
     /**
      * 检查是否需要高亮警告
@@ -256,9 +266,12 @@ export abstract class BaseStatusBarItem<T> {
      * 接收到跨实例状态更新事件后的钩子方法
      * 子类可重写以同步额外的内部状态
      */
-    protected onStatusUpdatedFromEvent(_data: T): void {
+    protected onStatusUpdatedFromEvent(_data: T, _requestBalanceKeyHash?: string, _timestamp?: number): void {
         // 默认为空实现
     }
+
+    /** 从持久化状态恢复后同步依赖状态数据的本地快照。 */
+    protected onStatusRestoredFromCache(_data: T, _requestBalanceKeyHash?: string, _timestamp?: number): void {}
 
     /**
      * 检测到本槽位 API Key 可能已变化（本地设置或跨实例事件）时的钩子
@@ -419,25 +432,30 @@ export abstract class BaseStatusBarItem<T> {
 
         const now = Date.now();
         const timeSinceLastUpdate = now - this.lastDelayedUpdateTime;
+        const cacheAge = this.lastStatusData ? now - this.lastStatusData.timestamp : this.AUTOMATIC_REFRESH_CACHE_MS;
+        const pendingCacheDelay =
+            this.delayedRefreshPending && cacheAge >= 0 && cacheAge < this.AUTOMATIC_REFRESH_CACHE_MS ?
+                this.AUTOMATIC_REFRESH_CACHE_MS - cacheAge
+            :   0;
 
         // 如果距离上次更新不足阈值，则等到满阈值再执行
-        const finalDelayMs =
-            timeSinceLastUpdate < this.MIN_DELAYED_UPDATE_INTERVAL ?
-                this.MIN_DELAYED_UPDATE_INTERVAL - timeSinceLastUpdate
-            :   delayMs;
+        const finalDelayMs = Math.max(
+            delayMs,
+            this.MIN_DELAYED_UPDATE_INTERVAL - timeSinceLastUpdate,
+            pendingCacheDelay
+        );
 
         StatusLogger.debug(`[${this.config.logPrefix}] Scheduled delayed update in ${finalDelayMs / 1000} seconds`);
 
         // 设置新的防抖定时器
         this.updateDebouncer = setTimeout(async () => {
+            this.updateDebouncer = undefined;
             try {
                 StatusLogger.debug(`[${this.config.logPrefix}] Running delayed update`);
                 this.lastDelayedUpdateTime = Date.now();
                 await this.performInitialUpdate();
             } catch (error) {
                 StatusLogger.error(`[${this.config.logPrefix}] Delayed update failed`, error);
-            } finally {
-                this.updateDebouncer = undefined;
             }
         }, finalDelayMs);
     }
@@ -478,6 +496,7 @@ export abstract class BaseStatusBarItem<T> {
         this.manualRefreshPending = false;
         this.automaticRefreshPending = false;
         this.automaticRefreshRetryCount = 0;
+        this.delayedRefreshPending = false;
         this.statusBarEligible = false;
         this.statusBarErrorDisplayed = false;
         this.context = undefined;
@@ -572,6 +591,8 @@ export abstract class BaseStatusBarItem<T> {
         if (this.isLoading) {
             if (isManualRefresh) {
                 this.manualRefreshPending = true;
+            } else {
+                this.delayedRefreshPending = true;
             }
             StatusLogger.debug(`[${this.config.logPrefix}] Query already running. Skipping duplicate request.`);
             return;
@@ -585,10 +606,13 @@ export abstract class BaseStatusBarItem<T> {
         if (!isManualRefresh && this.lastStatusData) {
             try {
                 const dataAge = Date.now() - this.lastStatusData.timestamp;
-                if (dataAge >= 0 && dataAge < 5000) {
+                if (dataAge >= 0 && dataAge < this.AUTOMATIC_REFRESH_CACHE_MS) {
                     StatusLogger.debug(
                         `[${this.config.logPrefix}] Cached data is still valid within 5 seconds (${(dataAge / 1000).toFixed(1)}s ago). Skipping auto refresh.`
                     );
+                    if (this.delayedRefreshPending) {
+                        this.delayedUpdate(this.AUTOMATIC_REFRESH_CACHE_MS - dataAge);
+                    }
                     return;
                 }
             } catch {
@@ -599,6 +623,11 @@ export abstract class BaseStatusBarItem<T> {
             }
         }
 
+        if (this.delayedRefreshPending && this.updateDebouncer) {
+            clearTimeout(this.updateDebouncer);
+            this.updateDebouncer = undefined;
+        }
+        this.delayedRefreshPending = false;
         this.isLoading = true;
         const generation = this.queryGeneration;
         const context = this.context;
@@ -619,7 +648,8 @@ export abstract class BaseStatusBarItem<T> {
                     // 保存完整的用量数据
                     this.lastStatusData = {
                         data: data,
-                        timestamp: Date.now()
+                        timestamp: result.queriedAt ?? Date.now(),
+                        ...(result.requestBalanceKeyHash ? { requestBalanceKeyHash: result.requestBalanceKeyHash } : {})
                     };
                     this.automaticRefreshRetryCount = 0;
 
@@ -692,6 +722,15 @@ export abstract class BaseStatusBarItem<T> {
                 } else {
                     this.automaticRefreshRetryCount = 0;
                 }
+                if (
+                    this.delayedRefreshPending &&
+                    !this.isLoading &&
+                    context === this.context &&
+                    statusBarItem === this.statusBarItem &&
+                    this.statusBarItem
+                ) {
+                    this.delayedUpdate(this.AUTOMATIC_REFRESH_CACHE_MS);
+                }
             }
         }
     }
@@ -757,6 +796,11 @@ export abstract class BaseStatusBarItem<T> {
 
                 // 更新内存中的数据
                 this.lastStatusData = cachedStatusData;
+                this.onStatusRestoredFromCache(
+                    cachedStatusData.data,
+                    cachedStatusData.requestBalanceKeyHash,
+                    cachedStatusData.timestamp
+                );
 
                 // 更新状态栏显示
                 this.updateStatusBarUI(cachedStatusData.data);
@@ -804,6 +848,14 @@ export abstract class BaseStatusBarItem<T> {
             if (!cachedData || !cachedData.data) {
                 return;
             }
+            if (
+                !Number.isFinite(cachedData.timestamp) ||
+                cachedData.timestamp < 0 ||
+                cachedData.timestamp > Date.now()
+            ) {
+                StatusLogger.debug(`[${this.config.logPrefix}] Ignored invalid inter-instance status timestamp`);
+                return;
+            }
             if (this.lastStatusData && cachedData.timestamp <= this.lastStatusData.timestamp) {
                 StatusLogger.debug(`[${this.config.logPrefix}] Ignored stale inter-instance status update`);
                 return;
@@ -817,7 +869,7 @@ export abstract class BaseStatusBarItem<T> {
             }
 
             this.updateStatusBarUI(cachedData.data);
-            this.onStatusUpdatedFromEvent(cachedData.data);
+            this.onStatusUpdatedFromEvent(cachedData.data, cachedData.requestBalanceKeyHash, cachedData.timestamp);
 
             StatusLogger.debug(
                 `[${this.config.logPrefix}] Updated status from inter-instance event (${((Date.now() - cachedData.timestamp) / 1000).toFixed(1)}s ago)`

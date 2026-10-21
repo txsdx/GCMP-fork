@@ -8,6 +8,11 @@ import { OpenAICustomHandler } from '../../src/handlers/openai/openaiCustomHandl
 import { AnthropicHandler } from '../../src/handlers/anthropic/anthropicHandler';
 import { GeminiHandler } from '../../src/handlers/gemini/geminiHandler';
 import { GenericModelProvider } from '../../src/providers/genericModelProvider';
+import { BalanceQueryManager } from '../../src/quota/compatible/balanceQueryManager';
+import { cacheRequestBalance } from '../../src/quota/requestBalance';
+import { StatusBarManager } from '../../src/status/statusBarManager';
+import { TokenUsagesManager } from '../../src/usages/usagesManager';
+import type { RequestBalanceLog } from '../../src/usages/fileLogger/types';
 import type { CustomHeaders, ModelConfig, ProviderConfig } from '../../src/types/sharedTypes';
 import { ApiKeyManager } from '../../src/utils/config/apiKeyManager';
 import { captureRequestApiKeyNames } from '../../src/utils/config/configSetCommands';
@@ -119,6 +124,226 @@ function execute(
 }
 
 suite('request API key usage identity', () => {
+    const completionScenarios: Array<{
+        name: string;
+        dispatched: boolean;
+        outcome: 'completed' | 'failed' | 'cancelled';
+        notificationFails?: boolean;
+    }> = [
+        { name: 'completed', dispatched: true, outcome: 'completed' },
+        { name: 'failed', dispatched: true, outcome: 'failed' },
+        { name: 'cancelled', dispatched: true, outcome: 'cancelled' },
+        { name: 'not-dispatched', dispatched: false, outcome: 'failed' },
+        { name: 'notification-failure', dispatched: true, outcome: 'completed', notificationFails: true },
+        { name: 'failed-notification-failure', dispatched: true, outcome: 'failed', notificationFails: true }
+    ];
+    for (const sdkMode of ['openai', 'openai-sse', 'openai-responses', 'anthropic', 'gemini-sse'] as const) {
+        for (const scenario of completionScenarios) {
+            test(`request completion refresh ${sdkMode} ${scenario.name}`, async () => {
+                const requestId = `completion-refresh-${sdkMode}-${scenario.name}`;
+                const apiKey = `completion-key-${sdkMode}-${scenario.name}`;
+                const notifications: string[] = [];
+                const snapshots: Array<RequestBalanceLog | null | undefined> = [];
+                const notify = StatusBarManager.notifyRequestCompleted;
+                const usages = TokenUsagesManager.instance;
+                const recordBalance = usages.recordRequestBalance;
+                const cancellation = new vscode.CancellationTokenSource();
+                const failure = new Error('request failed before completion refresh');
+                const { provider, secrets } = createFixture(
+                    async (
+                        _model,
+                        _config,
+                        _messages,
+                        _options,
+                        _progress,
+                        _requestId,
+                        _sessionId,
+                        _token,
+                        _startedAt,
+                        dispatched
+                    ) => {
+                        if (scenario.dispatched) {
+                            dispatched?.(Date.now());
+                        }
+                        if (scenario.outcome === 'failed') {
+                            throw failure;
+                        }
+                        if (scenario.outcome === 'cancelled') {
+                            throw new vscode.CancellationError();
+                        }
+                    }
+                );
+                secrets.set('test-provider.apiKey', apiKey);
+                cacheRequestBalance(
+                    'test-provider',
+                    apiKey,
+                    [{ id: 'wallet', balance: 20, currency: 'USD' }],
+                    Date.now() - 1000
+                );
+                usages.recordRequestBalance = (_id, balance) => snapshots.push(balance);
+                StatusBarManager.notifyRequestCompleted = key => {
+                    notifications.push(key);
+                    cacheRequestBalance(key, apiKey, [{ id: 'wallet', balance: 10, currency: 'USD' }]);
+                    if (scenario.notificationFails) {
+                        throw new Error('refresh notification failed');
+                    }
+                };
+                try {
+                    const result = execute(provider, sdkMode, requestId, cancellation.token);
+                    if (scenario.outcome === 'failed') {
+                        await assert.rejects(result, { message: failure.message });
+                    } else if (scenario.outcome === 'cancelled') {
+                        await assert.rejects(result, vscode.CancellationError);
+                    } else {
+                        await result;
+                    }
+                    assert.deepEqual(notifications, scenario.dispatched ? ['test-provider'] : []);
+                    assert.equal(snapshots.length, scenario.dispatched ? 1 : 0);
+                    if (scenario.dispatched) {
+                        assert.equal(snapshots[0]?.entries[0].balance, 20);
+                    }
+                } finally {
+                    StatusBarManager.notifyRequestCompleted = notify;
+                    usages.recordRequestBalance = recordBalance;
+                    cancellation.dispose();
+                }
+            });
+        }
+    }
+
+    test('request completion refresh notifies once across retries ending before the final dispatch', async () => {
+        const notifications: string[] = [];
+        const notify = StatusBarManager.notifyRequestCompleted;
+        const cancellation = new vscode.CancellationTokenSource();
+        let attempts = 0;
+        const { provider } = createFixture(
+            async (
+                _model,
+                _config,
+                _messages,
+                _options,
+                _progress,
+                _requestId,
+                _sessionId,
+                _token,
+                _startedAt,
+                dispatched
+            ) => {
+                attempts++;
+                if (attempts === 1) {
+                    dispatched?.(Date.now());
+                    throw new Error('retry after dispatch');
+                }
+                throw new Error('final attempt failed before dispatch');
+            }
+        );
+        provider.getRequestRetryConfig = () => ({ enabled: true, maxAttempts: 1, initialDelayMs: 0, maxDelayMs: 0 });
+        StatusBarManager.notifyRequestCompleted = key => notifications.push(key);
+        try {
+            await assert.rejects(
+                execute(provider, 'openai', 'completion-refresh-retry', cancellation.token),
+                /final attempt failed before dispatch/
+            );
+            assert.equal(attempts, 2);
+            assert.deepEqual(notifications, ['test-provider']);
+        } finally {
+            StatusBarManager.notifyRequestCompleted = notify;
+            cancellation.dispose();
+        }
+    });
+
+    test('request balance snapshot follows each dispatched credential across retries', async () => {
+        const requestId = 'balance-credential-retry';
+        const balances: Array<RequestBalanceLog | null | undefined> = [];
+        const dispatchedConfigs: ModelConfig[] = [];
+        let balanceQueryCount = 0;
+        const usages = TokenUsagesManager.instance;
+        const recordRequestBalance = usages.recordRequestBalance;
+        usages.recordRequestBalance = (id, balance) => {
+            assert.equal(id, requestId);
+            balances.push(balance);
+        };
+        BalanceQueryManager.registerHandler('test-provider', {
+            async queryBalance() {
+                balanceQueryCount++;
+                throw new Error('Request completion must not fetch balance');
+            }
+        });
+        cacheRequestBalance('test-provider', 'current-request-key', [
+            { id: 'test-provider', balance: 1, currency: 'USD' }
+        ]);
+        cacheRequestBalance('test-provider', 'retry-request-key', [
+            { id: 'test-provider', balance: 2, currency: 'USD' }
+        ]);
+        let attempts = 0;
+        const cancellation = new vscode.CancellationTokenSource();
+        const { provider, secrets } = createFixture(
+            async (
+                _model,
+                config,
+                _messages,
+                _options,
+                _progress,
+                _requestId,
+                _sessionId,
+                _token,
+                _startedAt,
+                dispatched
+            ) => {
+                attempts++;
+                const dispatchedKey = await ApiKeyManager.getApiKeyForRequest('test-provider', config);
+                dispatched?.(Date.now());
+                assert.equal(balances.length, attempts);
+                dispatchedConfigs.push(config);
+                cacheRequestBalance('test-provider', dispatchedKey ?? '', [
+                    { id: 'test-provider', balance: 100 + attempts, currency: 'USD' }
+                ]);
+                if (attempts === 1) {
+                    secrets.set('test-provider.apiKey', 'retry-request-key');
+                    throw new Error('retry this attempt');
+                }
+            }
+        );
+        provider.getRequestRetryConfig = () => ({ enabled: true, maxAttempts: 1, initialDelayMs: 0, maxDelayMs: 0 });
+        try {
+            await execute(provider, 'openai', requestId, cancellation.token);
+            assert.equal(attempts, 2);
+            assert.equal(balances.length, 2);
+            secrets.set('test-provider.apiKey', 'changed-after-dispatch');
+            assert.equal(balances[0]?.entries[0].balance, 1);
+            assert.equal(balances[1]?.entries[0].balance, 2);
+            cacheRequestBalance('test-provider', 'rebound-request-key', [
+                { id: 'test-provider', balance: 99, currency: 'USD' }
+            ]);
+            for (const config of dispatchedConfigs) {
+                ApiKeyManager.bindRequestApiKey(config, 'rebound-request-key');
+                await ApiKeyManager.getApiKeyForRequest('test-provider', config);
+            }
+            assert.equal(balances[0]?.entries[0].balance, 1);
+            assert.equal(balances[1]?.entries[0].balance, 2);
+            secrets.set('test-provider.apiKey', 'missing-start-key');
+            await execute(provider, 'openai', requestId, cancellation.token);
+            assert.equal(balances.length, 3);
+            assert.equal(balances[2], undefined);
+            secrets.set('test-provider.apiKey', 'stale-start-key');
+            cacheRequestBalance(
+                'test-provider',
+                'stale-start-key',
+                [{ id: 'test-provider', balance: 3, currency: 'USD' }],
+                Date.now() - 360_000
+            );
+            await execute(provider, 'openai', requestId, cancellation.token);
+            assert.equal(balances.length, 4);
+            assert.equal(balances[3], undefined);
+            assert.equal(balanceQueryCount, 0);
+            assert.equal(JSON.stringify(balances[1]).includes('retry-request-key'), false);
+        } finally {
+            usages.recordRequestBalance = recordRequestBalance;
+            BalanceQueryManager.unregisterHandler('test-provider');
+            cancellation.dispose();
+        }
+    });
+
     for (const sdkMode of ['openai', 'openai-sse', 'openai-responses', 'anthropic', 'gemini-sse'] as const) {
         for (const snapshot of [false, true]) {
             test(`${sdkMode} logs the consumed ${snapshot ? 'bound' : 'current'} key rather than a later global key`, async () => {
