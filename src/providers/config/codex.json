@@ -144,7 +144,7 @@
         },
         {
             "id": "gpt-6-luna",
-            "name": "GPT-6-Luna (ChatGPT)",
+            "name": "GPT-6 Luna (ChatGPT)",
             "sdkMode": "openai-responses",
             "tooltip": "OpenAI 最高效的 GPT-6 模型，适合摘要、信息提取、聚焦编程等目标明确的高频任务，支持 Max 推理强度",
             "contextSize": [400000, 1000000],
