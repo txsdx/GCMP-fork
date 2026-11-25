@@ -1,4 +1,4 @@
-﻿import assert from 'node:assert/strict';
+import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
 import test from 'node:test';
 
@@ -741,4 +741,249 @@ test('Responses 空工具图片明确说明无法投递且不产生图片消息'
         output: UNSUPPORTED_IMAGE_PLACEHOLDER,
         status: 'completed'
     });
+});
+
+test('非严格回显端点在 ThinkingPart 被剥离时仍从 marker 回放明文', async () => {
+    const { OpenAIResponsesMessageConverter } = await getConverterModule();
+    const converter = new OpenAIResponsesMessageConverter(handlerStub, 'Test');
+
+    const result = converter.convertMessagesToOpenAIResponses(
+        [
+            {
+                role: vscodeMock.LanguageModelChatMessageRole.Assistant,
+                content: [
+                    createMarkerPart({
+                        provider: 'compatible',
+                        modelId: 'glm-5.3',
+                        sdkMode: 'openai-responses',
+                        sessionId: 'session-1',
+                        responseId: 'response-1',
+                        completeThinking: '完整思考'
+                    }),
+                    new vscodeMock.LanguageModelTextPart('answer')
+                ]
+            }
+        ] as never,
+        { id: 'glm-5.3', model: 'glm-5.3', provider: 'compatible' } as never,
+        { provider: 'compatible', modelId: 'glm-5.3' }
+    );
+
+    assert.deepEqual(result.messages, [
+        { type: 'reasoning', summary: [], content: [{ type: 'reasoning_text', text: '完整思考' }] },
+        {
+            type: 'message',
+            role: 'assistant',
+            status: 'completed',
+            content: [{ type: 'output_text', text: 'answer' }]
+        }
+    ]);
+});
+
+for (const modelConfig of [
+    { id: 'gpt-5.4' },
+    { id: 'glm-5.3', extraBody: { include: null } },
+    { id: 'glm-5.3', extraBody: { include: [] } }
+]) {
+    test(`marker 明文回退保留回放限制: ${JSON.stringify(modelConfig)}`, async () => {
+        const { OpenAIResponsesMessageConverter } = await getConverterModule();
+        const converter = new OpenAIResponsesMessageConverter(handlerStub, 'Test');
+
+        const result = converter.convertMessagesToOpenAIResponses(
+            [
+                {
+                    role: vscodeMock.LanguageModelChatMessageRole.Assistant,
+                    content: [
+                        createMarkerPart({
+                            provider: 'compatible',
+                            modelId: modelConfig.id,
+                            sdkMode: 'openai-responses',
+                            sessionId: 'session-1',
+                            responseId: 'response-1',
+                            completeThinking: '完整思考'
+                        })
+                    ]
+                }
+            ] as never,
+            modelConfig as never,
+            { provider: 'compatible', modelId: modelConfig.id }
+        );
+
+        assert.deepEqual(result.messages, []);
+    });
+}
+
+const deepSeekConfig = {
+    id: 'deepseek-flash',
+    model: 'deepseek-flash',
+    provider: 'deepseek',
+    baseUrl: 'https://api.deepseek.com/v1'
+};
+
+test('思考内容被剥离的工具轮次补非空 reasoning 占位（DeepSeek 严格回显）', async () => {
+    const { OpenAIResponsesMessageConverter } = await getConverterModule();
+    const converter = new OpenAIResponsesMessageConverter(handlerStub, 'Test');
+
+    const result = converter.convertMessagesToOpenAIResponses(
+        [
+            {
+                role: vscodeMock.LanguageModelChatMessageRole.Assistant,
+                content: [{ callId: 'call-1', name: 'read_file', input: { path: 'a.ts' } }]
+            },
+            {
+                role: vscodeMock.LanguageModelChatMessageRole.User,
+                content: [{ callId: 'call-1', content: [{ value: 'ok' }] }]
+            }
+        ] as never,
+        deepSeekConfig as never,
+        { provider: 'deepseek', modelId: 'deepseek-flash' },
+        { injectReasoningPlaceholder: true }
+    );
+
+    assert.deepEqual(result.messages[0], {
+        type: 'reasoning',
+        summary: [],
+        content: [{ type: 'reasoning_text', text: ' ' }]
+    });
+    assert.equal(result.messages[1].type, 'function_call');
+});
+
+test('已有可回放思考内容时不补占位', async () => {
+    const { OpenAIResponsesMessageConverter } = await getConverterModule();
+    const converter = new OpenAIResponsesMessageConverter(handlerStub, 'Test');
+
+    const result = converter.convertMessagesToOpenAIResponses(
+        [
+            {
+                role: vscodeMock.LanguageModelChatMessageRole.Assistant,
+                content: [
+                    new vscodeMock.LanguageModelThinkingPart('真实思考'),
+                    { callId: 'call-1', name: 'read_file', input: { path: 'a.ts' } }
+                ]
+            }
+        ] as never,
+        deepSeekConfig as never,
+        { provider: 'deepseek', modelId: 'deepseek-flash' },
+        { injectReasoningPlaceholder: true }
+    );
+
+    assert.deepEqual(result.messages[0], {
+        type: 'reasoning',
+        summary: [],
+        content: [{ type: 'reasoning_text', text: '真实思考' }]
+    });
+});
+
+test('未开启占位策略时不为缺失思考的工具轮次插入 reasoning', async () => {
+    const { OpenAIResponsesMessageConverter } = await getConverterModule();
+    const converter = new OpenAIResponsesMessageConverter(handlerStub, 'Test');
+
+    const result = converter.convertMessagesToOpenAIResponses(
+        [
+            {
+                role: vscodeMock.LanguageModelChatMessageRole.Assistant,
+                content: [{ callId: 'call-1', name: 'read_file', input: { path: 'a.ts' } }]
+            }
+        ] as never,
+        deepSeekConfig as never,
+        { provider: 'deepseek', modelId: 'deepseek-flash' }
+    );
+
+    assert.equal(
+        result.messages.some(item => item.type === 'reasoning'),
+        false
+    );
+});
+
+test('DeepSeek 严格回显通道不回传 encrypted_content，改用非空明文占位', async () => {
+    const { OpenAIResponsesMessageConverter } = await getConverterModule();
+    const converter = new OpenAIResponsesMessageConverter(handlerStub, 'Test');
+
+    const result = converter.convertMessagesToOpenAIResponses(
+        [
+            {
+                role: vscodeMock.LanguageModelChatMessageRole.Assistant,
+                content: [
+                    createThinkingPart({
+                        redactedData: 'cipher-text',
+                        reasoningId: 'rs_1',
+                        provider: 'deepseek',
+                        modelId: 'deepseek-flash'
+                    }),
+                    { callId: 'call-1', name: 'read_file', input: { path: 'a.ts' } }
+                ]
+            }
+        ] as never,
+        deepSeekConfig as never,
+        { provider: 'deepseek', modelId: 'deepseek-flash' },
+        { injectReasoningPlaceholder: true }
+    );
+
+    assert.deepEqual(result.messages[0], {
+        type: 'reasoning',
+        summary: [],
+        content: [{ type: 'reasoning_text', text: ' ' }]
+    });
+    assert.equal(
+        result.messages.some(item => (item as { encrypted_content?: string }).encrypted_content !== undefined),
+        false
+    );
+});
+
+test('DeepSeek 严格回显通道优先回传明文思考而非密文', async () => {
+    const { OpenAIResponsesMessageConverter } = await getConverterModule();
+    const converter = new OpenAIResponsesMessageConverter(handlerStub, 'Test');
+
+    const result = converter.convertMessagesToOpenAIResponses(
+        [
+            {
+                role: vscodeMock.LanguageModelChatMessageRole.Assistant,
+                content: [
+                    createThinkingPart({
+                        redactedData: 'cipher-text',
+                        reasoningId: 'rs_1',
+                        provider: 'deepseek',
+                        modelId: 'deepseek-flash'
+                    }),
+                    new vscodeMock.LanguageModelThinkingPart('真实思考'),
+                    { callId: 'call-1', name: 'read_file', input: { path: 'a.ts' } }
+                ]
+            }
+        ] as never,
+        deepSeekConfig as never,
+        { provider: 'deepseek', modelId: 'deepseek-flash' },
+        { injectReasoningPlaceholder: true }
+    );
+
+    assert.deepEqual(result.messages[0], {
+        type: 'reasoning',
+        summary: [],
+        content: [{ type: 'reasoning_text', text: '真实思考' }]
+    });
+});
+
+test('非严格回显端点仍回传 encrypted_content', async () => {
+    const { OpenAIResponsesMessageConverter } = await getConverterModule();
+    const converter = new OpenAIResponsesMessageConverter(handlerStub, 'Test');
+
+    const result = converter.convertMessagesToOpenAIResponses(
+        [
+            {
+                role: vscodeMock.LanguageModelChatMessageRole.Assistant,
+                content: [
+                    createThinkingPart({
+                        redactedData: 'cipher-text',
+                        reasoningId: 'rs_1',
+                        provider: 'openai',
+                        modelId: 'gpt-5.4'
+                    })
+                ]
+            }
+        ] as never,
+        { id: 'gpt-5.4', model: 'gpt-5.4', provider: 'openai', extraBody: gptIncludeEnabled } as never,
+        { provider: 'openai', modelId: 'gpt-5.4' }
+    );
+
+    assert.deepEqual(result.messages, [
+        { type: 'reasoning', summary: [], encrypted_content: 'cipher-text', id: 'rs_1' }
+    ]);
 });

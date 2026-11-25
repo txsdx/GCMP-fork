@@ -6,6 +6,7 @@ import { Logger } from '../../utils/runtime/logger';
 import { isSubRequest, shouldDisableThinkingForRequest, type RequestKind } from '../classification/requestClassifier';
 import { getScopedRequestClassification } from '../classification/requestClassification';
 import { canDisableThinking } from '../thinkingSupport';
+import { isDeepSeekFamily, shouldInjectReasoningPlaceholder } from '../reasoningPlaceholder';
 import { mergeNativeToolConfigs } from '../nativeToolUtils';
 import type { OpenAIResponsesMessageConverter } from './openaiResponsesMessageConverter';
 import { filterResponsesExtraBodyParams } from './responses/requestParameters';
@@ -99,10 +100,16 @@ export class OpenAIResponsesRequestBuilder {
         const requestKind = (options.modelOptions as { requestKind?: string } | undefined)?.requestKind as
             | RequestKind
             | undefined;
+        const requestOverrides: Record<string, unknown> = {};
+        const filteredExtraBody = this.applyExtraBody(requestOverrides, modelConfig, sessionId);
+        this.applyModelSettings(requestOverrides, modelConfig, requestModel.toLowerCase(), options, requestKind);
+        removeNullExtraBodyParams(requestOverrides, filteredExtraBody);
+
         const { systemMessage, messages: responsesMessages } = this.messageConverter.convertMessagesToOpenAIResponses(
             messages,
             modelConfig,
-            requestOrigin
+            requestOrigin,
+            { injectReasoningPlaceholder: this.shouldInjectReasoningPlaceholder(modelConfig, requestOverrides) }
         );
 
         const requestBody = initializeResponsesRequestBody({
@@ -112,8 +119,6 @@ export class OpenAIResponsesRequestBuilder {
             extraBody: modelConfig.extraBody
         });
         Logger.debug(`🎯 ${model.name} Using prompt_cache_key: ${sessionId}`);
-
-        const modelId = requestModel.toLowerCase();
 
         applyResponsesSystemMessage({
             requestBody,
@@ -133,13 +138,35 @@ export class OpenAIResponsesRequestBuilder {
         if (!requestKind || !isSubRequest(requestKind, getScopedRequestClassification(options))) {
             this.applyNativeTools(requestBody, modelConfig);
         }
-        const filteredExtraBody = this.applyExtraBody(requestBody, modelConfig, sessionId);
-        this.applyModelSettings(requestBody, modelConfig, modelId, options, requestKind);
+        Object.assign(requestBody, requestOverrides);
         this.preprocessInputAndTools(requestBody);
         removeNullExtraBodyParams(requestBody, filteredExtraBody);
 
         return { requestBody };
     }
+
+    /**
+     * 是否为缺失的明文 reasoning 补占位。
+     *
+     * 仅对严格回显端点（DeepSeek / MiMo）在思考模式下启用：这些端点要求每条 assistant 轮次
+     * 回传非空 reasoning 明文，缺失即整轮 400（子代理、上下文压缩、跨模型续接都会造成缺失）。
+     * 思考被显式关闭时不需要回传，也避免向非思考请求注入多余 item。
+     */
+    private shouldInjectReasoningPlaceholder(modelConfig: ModelConfig, requestBody: Record<string, unknown>): boolean {
+        if (!shouldInjectReasoningPlaceholder({ providerKey: this.providerKey, modelConfig })) {
+            return false;
+        }
+        const reasoning = requestBody.reasoning as { effort?: unknown } | undefined;
+        if (typeof reasoning?.effort === 'string') {
+            return reasoning.effort !== 'none';
+        }
+        if (isDeepSeekFamily({ providerKey: this.providerKey, modelConfig })) {
+            return true;
+        }
+        const thinking = requestBody.thinking as { type?: unknown } | undefined;
+        return thinking?.type !== 'disabled' && requestBody.enable_thinking !== false;
+    }
+
     private applyDeclaredTools(
         requestBody: Record<string, unknown>,
         options: vscode.ProvideLanguageModelChatResponseOptions
